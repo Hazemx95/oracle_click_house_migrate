@@ -1,0 +1,518 @@
+# Implementation Plan: Oracle to ClickHouse Parallel Data Migration Engine
+
+**Branch**: `001-oracle-clickhouse-migration` | **Date**: 2026-06-10 | **Spec**: [spec.md](./spec.md)
+
+**Input**: Feature specification from `specs/001-oracle-clickhouse-migration/spec.md` and source plan `PLAN.md`
+
+## Summary
+
+A Python FastAPI web application that lets an engineer migrate selected Oracle tables into a single fixed ClickHouse database (`oracle_migration_hazem`) through a browser GUI. The app dynamically discovers Oracle schemas/tables/columns, generates ClickHouse table definitions from Oracle metadata, and copies data using memory-bounded batch extraction and batch inserts, first single-threaded and then in parallel. Oracle is strictly read-only; ClickHouse writes are confined to the one target database; all credentials come from environment variables only.
+
+The work is delivered **phase by phase** (Phase 0 through Phase 10). Each phase has a goal, scope, files, the code that must exist when it ends, acceptance criteria, manual test commands, and a hard stop point. No phase begins until the prior phase is verified.
+
+## Technical Context
+
+**Language/Version**: Python 3.11+
+
+**Primary Dependencies**: FastAPI, uvicorn[standard], python-dotenv, pydantic, jinja2, python-multipart, oracledb (Oracle driver, thin mode), clickhouse-connect
+
+**Storage**: Source = Oracle (read-only, accessed via `all_tables`/`all_tab_columns` metadata and `SELECT` on source tables). Target = ClickHouse database `oracle_migration_hazem` (MergeTree tables). Job state = in-process store (in-memory registry) in Phases 6–8; optional persistent audit table in Phase 10.
+
+**Testing**: pytest (unit for config/type-mapping/range-splitting; manual `curl`/browser checks per phase as defined in PLAN.md)
+
+**Target Platform**: Linux server / container; reachable at `http://localhost:8000`; run via local uvicorn and via `docker compose up -d --build`
+
+**Project Type**: Web service with server-rendered GUI (single FastAPI app serving JSON APIs + Jinja2 template + static JS/CSS)
+
+**Performance Goals**: Memory bounded by `MIGRATION_BATCH_SIZE` (default 100000 rows) regardless of table size; job id returned within a few seconds of launch; parallel mode (default 8, max 16 workers) measurably faster than single-thread on medium tables
+
+**Constraints**: Oracle is read-only (SELECT only); ClickHouse writes only to `oracle_migration_hazem`; credentials from environment variables only, never hardcoded or logged; bind variables for all parameterized Oracle queries; no full-table reads into memory
+
+**Scale/Scope**: Single-instance internal tool for engineers; one migration job per table; handles small/medium/large tables via batching and parallel range/hash extraction
+
+## Constitution Check
+
+*GATE: Must pass before Phase 0 research. Re-check after Phase 1 design.*
+
+Evaluated against the project constitution v1.0.0 (`.specify/memory/constitution.md`). All seven principles are satisfied by this design:
+
+- **I. Oracle read-only (NON-NEGOTIABLE)**: PASS — all Oracle access routes through one read-only client issuing only `SELECT`; a guard rejects any non-read statement.
+- **II. ClickHouse target restricted (NON-NEGOTIABLE)**: PASS — every write goes through a wrapper that forces/validates database `oracle_migration_hazem` and rejects any other; only `CREATE TABLE IF NOT EXISTS`/`INSERT`/`SELECT` used.
+- **III. Environment-based credentials (NON-NEGOTIABLE)**: PASS — config via `.env`/pydantic, `.env.example` placeholders only, `.gitignore` excludes `.env`, no secrets in code/Docker/README/tests.
+- **IV. Phase-based implementation**: PASS — Phases 0–10 each carry scope, files, acceptance criteria, manual test commands, and a stop point.
+- **V. Memory-safe large-table migration**: PASS — chunked `fetchmany` + ClickHouse batch inserts; parallel mode (Phase 7) added only after single-thread (Phase 6); workers default 8, max 16; range modes guarantee no duplicate/missing rows.
+- **VI. Dynamic, metadata-driven GUI**: PASS — schemas/tables/columns loaded from Oracle metadata; target schema auto-fills; ClickHouse DB fixed/disabled (Phase 4).
+- **VII. Security & safety first (NON-NEGOTIABLE)**: PASS — no secret logging; schema/table/column validated against metadata; bind variables for Oracle queries; no raw input concatenated into SQL.
+
+No violations to justify; Complexity Tracking is not required. This gate is re-checked after Phase 1 design (artifacts produced: research.md, data-model.md, contracts/, quickstart.md) and remains PASS.
+
+## Project Structure
+
+### Documentation (this feature)
+
+```text
+specs/001-oracle-clickhouse-migration/
+├── plan.md              # This file (/speckit-plan output)
+├── spec.md              # Feature specification (/speckit-specify output)
+├── research.md          # Phase 0 research (this command)
+├── data-model.md        # Phase 1 design (this command)
+├── quickstart.md        # Phase 1 validation guide (this command)
+├── contracts/           # Phase 1 API contracts (this command)
+│   ├── health.md
+│   ├── oracle-metadata.md
+│   ├── clickhouse-ddl.md
+│   └── migrations.md
+└── tasks.md             # Phase 2 output (/speckit-tasks — NOT created here)
+```
+
+### Source Code (repository root)
+
+```text
+oracle_click_house_migrate/
+├── PLAN.md
+├── README.md
+├── requirements.txt
+├── Dockerfile
+├── docker-compose.yml
+├── .env.example
+├── .gitignore
+│
+├── app/
+│   ├── __init__.py
+│   ├── main.py                  # FastAPI app, router registration, template/static mount
+│   ├── config.py                # Env-based settings (pydantic), fixed target DB constant
+│   │
+│   ├── db/
+│   │   ├── __init__.py
+│   │   ├── oracle_client.py     # Read-only Oracle connection + SELECT-only guard
+│   │   └── clickhouse_client.py # ClickHouse connection + target-DB confinement guard
+│   │
+│   ├── api/
+│   │   ├── __init__.py
+│   │   ├── health_routes.py     # /api/health, /api/health/oracle, /api/health/clickhouse
+│   │   ├── oracle_routes.py     # /api/oracle/schemas|tables|columns|partition-columns
+│   │   ├── clickhouse_routes.py # /api/clickhouse/create-table-preview|create-table
+│   │   └── migration_routes.py  # /api/migrations ...
+│   │
+│   ├── services/
+│   │   ├── __init__.py
+│   │   ├── metadata_service.py  # Oracle discovery queries (bind vars), validation
+│   │   ├── ddl_mapper.py        # Oracle→ClickHouse type map, target naming, DDL builder
+│   │   ├── migration_service.py # Single-thread + parallel migration engine
+│   │   └── job_service.py       # Job registry, status, progress, validation results
+│   │
+│   ├── templates/
+│   │   └── index.html           # GUI page
+│   │
+│   └── static/
+│       ├── app.js               # Dynamic dropdown behavior, launch + polling
+│       └── style.css
+│
+└── tests/
+    ├── test_config.py
+    ├── test_ddl_mapper.py       # type mapping + naming (added Phase 5)
+    └── test_range_split.py      # numeric/date range splitting (added Phase 7)
+```
+
+**Structure Decision**: Single FastAPI web-service project exactly as laid out in PLAN.md §9. JSON APIs under `/api/*`, GUI served from `/` via Jinja2 with static assets. One added module `app/api/clickhouse_routes.py` (PLAN.md lists DDL endpoints but no dedicated route file; kept separate from `migration_routes.py` for clarity). Job state lives in `job_service.py` as an in-memory registry through Phase 8; an optional persistent audit table is introduced in Phase 10.
+
+---
+
+## Phased Implementation Plan
+
+> **Constitution gate — applies to EVERY phase (project constitution v1.0.0).** Before a phase's stop point is satisfied, all of the following MUST hold, in addition to that phase's own acceptance criteria:
+> - **P-I Oracle read-only (NON-NEGOTIABLE)**: only `SELECT` reaches Oracle; no `CREATE/ALTER/DROP/TRUNCATE/INSERT/UPDATE/DELETE/MERGE/EXEC/CALL`.
+> - **P-II ClickHouse confined (NON-NEGOTIABLE)**: every write targets only `oracle_migration_hazem`; any other database is rejected.
+> - **P-III Env-only credentials (NON-NEGOTIABLE)**: configuration/credentials come only from `.env`/environment; never hardcoded in code, `Dockerfile`, `docker-compose.yml`, `README`, `PLAN.md`, or tests; real `.env` git-ignored; only `.env.example` committed.
+> - **P-VII Security & safety (NON-NEGOTIABLE)**: no secrets in logs; schema/table/column names validated against metadata; bind variables used; no raw user input concatenated into SQL.
+> - **P-IV Phase discipline**: do not advance until this phase's acceptance criteria pass and its stop point is met.
+> - **P-V Memory safety**: any code touching source data uses chunked `fetchmany` + batch insert; no full-table load; parallel only after single-thread is proven.
+>
+> Each phase below restates the principles most at risk in that phase under **Constitution gate**; the full list above still applies even where not repeated. The NON-NEGOTIABLE principles (I, II, III, VII) admit no exceptions and cannot be waived via Complexity Tracking.
+
+### Phase 0 — Specification Initialization and Project Guardrails
+
+**Goal**: Lock in the rules, safety constraints, environment rules, folder expectations, and acceptance gates that govern all later phases — before any application code exists.
+
+**Scope**:
+- Confirm spec + plan + guardrails are written and agreed.
+- Define forbidden Oracle operations and allowed ClickHouse operations explicitly.
+- Define environment-variable-only configuration policy and the example-env / git-ignore policy.
+- Define the target folder structure and dependency list.
+- Define the global acceptance gates reused by every phase.
+
+**Files to create or update**:
+- `specs/001-oracle-clickhouse-migration/spec.md` (exists)
+- `specs/001-oracle-clickhouse-migration/plan.md`, `research.md`, `data-model.md`, `quickstart.md`, `contracts/*` (this command)
+- No application source files yet.
+
+**Code that must exist after the phase**: None. This phase produces documentation/guardrails only.
+
+**Acceptance criteria**:
+- Oracle read-only rule and forbidden-operation list documented.
+- ClickHouse write-confinement rule and allowed-operation list documented.
+- Environment rules, `.env.example` policy, and `.gitignore` policy documented.
+- Folder expectations and dependency list documented.
+- Global safety gates listed and referenced by later phases.
+
+**Constitution gate**: P-I/P-II/P-III/P-VII are documented as binding guardrails here; this phase establishes them. No source code, so no runtime checks yet.
+
+**Manual test commands**:
+```bash
+ls specs/001-oracle-clickhouse-migration/
+test -f specs/001-oracle-clickhouse-migration/plan.md && echo "plan present"
+test -f .specify/memory/constitution.md && echo "constitution present"
+```
+
+**Stop point**: Do not start Phase 1 until guardrails are reviewed and agreed.
+
+---
+
+### Phase 1 — Project Bootstrap and Docker Skeleton
+
+**Goal**: A runnable FastAPI skeleton with a home page and a health endpoint, runnable locally and via Docker Compose, with env example + gitignore in place and no hardcoded credentials.
+
+**Scope** (implement only): folder structure, FastAPI skeleton, basic home page, `.env.example`, `.gitignore`, `requirements.txt`, `Dockerfile`, `docker-compose.yml`. No Oracle/ClickHouse connection, no migration logic.
+
+**Files to create or update**:
+- `requirements.txt`, `Dockerfile`, `docker-compose.yml`, `.env.example`, `.gitignore`, `README.md` (stub)
+- `app/__init__.py`, `app/main.py`, `app/config.py`
+- `app/api/__init__.py`, `app/api/health_routes.py`
+- `app/templates/index.html`, `app/static/app.js`, `app/static/style.css`
+- `app/db/__init__.py`, `app/services/__init__.py` (empty packages)
+- `tests/test_config.py`
+
+**Code that must exist after the phase**:
+- `app.main:app` FastAPI instance mounting templates + static and including the health router.
+- `GET /` returns the GUI page (static shell is fine).
+- `GET /api/health` returns `{"status":"ok","service":"oracle-clickhouse-migration-engine"}`.
+- `app/config.py` reads settings from environment via `python-dotenv`/pydantic, exposes the fixed `CLICKHOUSE_DATABASE=oracle_migration_hazem` constant; no secrets in code.
+- `.env.example` with placeholder values; `.gitignore` excluding `.env`/`*.env`/`.venv/`/`__pycache__/` etc.
+
+**Acceptance criteria**: App starts locally; app starts via Docker Compose; browser opens home page; `/api/health` returns success; `.env` is git-ignored; no credentials hardcoded.
+
+**Constitution gate (P-III, P-VII)**: `.env` is git-ignored; only `.env.example` (placeholders) is committed; no real credentials appear in code, `Dockerfile`, `docker-compose.yml`, `README`, or tests; startup logs print no secrets.
+
+**Manual test commands**:
+```bash
+python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+curl http://localhost:8000/api/health
+docker compose up -d --build
+curl http://localhost:8000/api/health
+git check-ignore .env   # should print .env
+grep -rEi "password|passwd|secret" app/ Dockerfile docker-compose.yml README.md   # expect no real values
+```
+
+**Stop point**: Stop after Phase 1 until the user confirms the app starts successfully.
+
+---
+
+### Phase 2 — Database Connection Health Checks
+
+**Goal**: Confirm the app can connect to Oracle (read-only) and ClickHouse from its runtime environment and that the fixed target database exists.
+
+**Scope**: Oracle client, ClickHouse client, env-based config for both, Oracle health endpoint, ClickHouse health endpoint. No GUI dropdowns, no migration.
+
+**Files to create or update**:
+- `app/db/oracle_client.py` — connection factory using `oracledb`; helper that runs `SELECT 1 FROM dual` and `SELECT COUNT(*) FROM all_tables`; SELECT-only guard.
+- `app/db/clickhouse_client.py` — `clickhouse-connect` client; `SELECT 1`; target-DB existence query against `system.databases`.
+- `app/config.py` — add Oracle + ClickHouse settings, `CLICKHOUSE_ALLOW_CREATE_DATABASE=false` default.
+- `app/api/health_routes.py` — add `/api/health/oracle`, `/api/health/clickhouse`.
+- `app/main.py` — ensure health router wired.
+
+**Code that must exist after the phase**:
+- `GET /api/health/oracle` → `{"status":"success","database":"oracle","can_connect":true,"can_read_metadata":true}` (or a clear error).
+- `GET /api/health/clickhouse` → `{"status":"success","database":"clickhouse","can_connect":true,"target_database":"oracle_migration_hazem","target_database_exists":true|false}`.
+- Reusable connection helpers used by later phases; errors are structured and credential-free.
+- Target database is **not** auto-created (unless `CLICKHOUSE_ALLOW_CREATE_DATABASE=true`).
+
+**Acceptance criteria**: Oracle health succeeds; ClickHouse health succeeds; errors are clear; no credentials printed in logs; app still runs in Docker Compose.
+
+**Constitution gate (P-I, P-II, P-III, P-VII)**: Oracle health uses only `SELECT` (`SELECT 1 FROM dual`, `SELECT COUNT(*) FROM all_tables`); ClickHouse check only reads `system.databases` and never auto-creates the target unless `CLICKHOUSE_ALLOW_CREATE_DATABASE=true`; both clients read credentials only from environment; health responses and `docker logs` contain no credentials.
+
+**Manual test commands**:
+```bash
+curl http://localhost:8000/api/health/oracle
+curl http://localhost:8000/api/health/clickhouse
+docker compose up -d --build
+docker logs oracle-clickhouse-migration-app    # confirm NO credentials/secrets in output
+```
+
+**Stop point**: Stop after Phase 2 until both health checks succeed.
+
+---
+
+### Phase 3 — Oracle Metadata Discovery APIs
+
+**Goal**: Backend can dynamically discover Oracle schemas, tables, columns, and candidate partition/hash columns using bind variables.
+
+**Scope**: Metadata APIs only. No full GUI behavior, no migration.
+
+**Files to create or update**:
+- `app/services/metadata_service.py` — discovery queries (schemas, tables-by-schema, columns, partition-candidate columns) using bind variables; validation helpers (`schema_exists`, `table_exists`).
+- `app/api/oracle_routes.py` — the four GET endpoints.
+- `app/main.py` — include oracle router.
+
+**Code that must exist after the phase**:
+- `GET /api/oracle/schemas` → distinct owners from `all_tables`.
+- `GET /api/oracle/tables?schema=<schema>` → tables for that owner (bind var).
+- `GET /api/oracle/columns?schema=<schema>&table=<table>` → column name/type/length/precision/scale/nullable.
+- `GET /api/oracle/partition-columns?schema=<schema>&table=<table>` → NUMBER/DATE/TIMESTAMP% candidates.
+- Validation rejects schema/table not present in metadata with a controlled error (no raw concatenation into SQL).
+
+**Acceptance criteria**: all four endpoints return correct data; invalid schema/table returns controlled error; Oracle remains read-only.
+
+**Constitution gate (P-I, P-VII)**: all discovery queries are `SELECT` against `all_tables`/`all_tab_columns` only; `schema`/`table` are validated against metadata before use and passed as bind variables — never concatenated into SQL; an injection-style value (e.g. `CM'--`) returns a controlled error and executes no dynamic SQL.
+
+**Manual test commands**:
+```bash
+curl http://localhost:8000/api/oracle/schemas
+curl "http://localhost:8000/api/oracle/tables?schema=CM"
+curl "http://localhost:8000/api/oracle/columns?schema=CM&table=COMPONENT"
+curl "http://localhost:8000/api/oracle/partition-columns?schema=CM&table=COMPONENT"
+curl "http://localhost:8000/api/oracle/tables?schema=CM%27--"   # injection attempt → controlled error, no SQL executed
+```
+
+**Stop point**: Stop after Phase 3 until metadata APIs work correctly.
+
+---
+
+### Phase 4 — GUI Dynamic Dropdowns
+
+**Goal**: Interactive GUI behavior built on the metadata APIs.
+
+**Scope**: Frontend behavior only (using completed APIs). No migration.
+
+**Files to create or update**:
+- `app/templates/index.html` — all GUI fields from PLAN.md §6 (source schema, source table, partition/hash column, worker threads default 8, CH schema destination, CH database fixed+disabled, target table name, launch button).
+- `app/static/app.js` — load health + schemas on page load; on schema change load tables + auto-fill target schema; on table change load partition columns + auto-fill target table; keep CH database fixed/disabled.
+- `app/static/style.css` — basic styling and health indicators.
+
+**Code that must exist after the phase**:
+- On load: calls `/api/health/oracle`, `/api/health/clickhouse`, `/api/oracle/schemas`.
+- On schema select: calls `/api/oracle/tables?schema=...`, refreshes table dropdown, auto-fills CH schema destination.
+- On table select: calls `/api/oracle/partition-columns?...`, refreshes column dropdown, auto-fills target table name.
+- ClickHouse database field fixed and disabled to `oracle_migration_hazem`.
+
+**Acceptance criteria**: GUI loads schemas dynamically; changing source schema refreshes tables and auto-fills target schema; changing source table refreshes partition/hash columns and auto-fills target table; CH database is fixed to `oracle_migration_hazem`.
+
+**Constitution gate (P-VI, P-I)**: every dropdown is populated from live Oracle metadata (no hardcoded lists); the ClickHouse database field is rendered fixed and `disabled` to `oracle_migration_hazem` and cannot be edited; GUI issues only read/discovery calls (no writes in this phase).
+
+**Manual test commands**:
+```bash
+curl http://localhost:8000/            # returns GUI shell
+# In a browser + devtools, confirm on open: GET /api/health/oracle, /api/health/clickhouse, /api/oracle/schemas fire
+# Confirm the ClickHouse Database input is disabled and shows oracle_migration_hazem
+curl -s http://localhost:8000/ | grep -i "oracle_migration_hazem"   # fixed DB present in markup
+```
+
+**Stop point**: Stop after Phase 4 until GUI dynamic behavior works.
+
+---
+
+### Phase 5 — ClickHouse DDL Generation
+
+**Goal**: Generate and execute `CREATE TABLE IF NOT EXISTS` in `oracle_migration_hazem` from Oracle metadata.
+
+**Scope**: Type mapping, safe target naming, DDL generation, target-DB enforcement. No data migration yet.
+
+**Files to create or update**:
+- `app/services/ddl_mapper.py` — Oracle→ClickHouse type map (PLAN.md §13), safe-name builder `<schema>__<table>`, engine selection (`ORDER BY <col>` or `ORDER BY tuple()`), DDL string builder, target-DB guard.
+- `app/api/clickhouse_routes.py` — `POST /api/clickhouse/create-table-preview`, `POST /api/clickhouse/create-table`.
+- `app/db/clickhouse_client.py` — `execute_ddl` confined to target DB.
+- `app/main.py` — include clickhouse router.
+- `tests/test_ddl_mapper.py` — unit tests for mapping + naming + unsupported-type fallback.
+
+**Code that must exist after the phase**:
+- Type mapping incl. NUMBER scale 0 → `Nullable(Int64)`, NUMBER scale>0 → `Nullable(Float64)`, VARCHAR2/NVARCHAR2/CHAR/NCHAR/CLOB → `Nullable(String)`, DATE → `Nullable(DateTime)`, TIMESTAMP → `Nullable(DateTime64(6))`, FLOAT → `Nullable(Float64)`, BINARY_FLOAT → `Nullable(Float32)`, BINARY_DOUBLE → `Nullable(Float64)`, default `Nullable(String)`.
+- Preview endpoint returns DDL text without executing.
+- Create endpoint executes `CREATE TABLE IF NOT EXISTS oracle_migration_hazem.<schema>__<table> (...) ENGINE = MergeTree ORDER BY ...`.
+- Dangerous/other target-database values rejected; unsupported types do not crash.
+
+**Acceptance criteria**: DDL preview works; create works; table created only in `oracle_migration_hazem`; Oracle not modified; unsupported types do not crash; dangerous target values rejected.
+
+**Constitution gate (P-II, P-I, P-VII)**: the only ClickHouse statement executed is `CREATE TABLE IF NOT EXISTS` inside `oracle_migration_hazem`; the target-DB guard rejects any other database value; Oracle is touched only for read-only column metadata; identifiers are sanitized/quoted so DDL cannot be injected.
+
+**Manual test commands**:
+```bash
+curl -X POST http://localhost:8000/api/clickhouse/create-table-preview \
+  -H 'Content-Type: application/json' \
+  -d '{"schema":"CM","table":"COMPONENT","target_table":"CM__COMPONENT","order_by":null}'
+
+curl -X POST http://localhost:8000/api/clickhouse/create-table \
+  -H 'Content-Type: application/json' \
+  -d '{"schema":"CM","table":"COMPONENT","target_table":"CM__COMPONENT","order_by":null}'
+
+# negative: a different target database MUST be rejected
+curl -X POST http://localhost:8000/api/clickhouse/create-table \
+  -H 'Content-Type: application/json' \
+  -d '{"schema":"CM","table":"COMPONENT","target_table":"CM__COMPONENT","target_database":"default"}'   # expect rejection
+pytest tests/test_ddl_mapper.py
+```
+
+**Stop point**: Stop after Phase 5 until table creation works.
+
+---
+
+### Phase 6 — Single-Thread Batch Migration
+
+**Goal**: First working end-to-end Oracle→ClickHouse copy using memory-safe batch loading.
+
+**Scope**: Single-thread migration only. No parallel workers.
+
+**Files to create or update**:
+- `app/services/job_service.py` — in-memory job registry; create/get/update; status + progress fields.
+- `app/services/migration_service.py` — single-thread pipeline: validate source, confirm target DB, ensure table, `fetchmany(batch_size)` loop, batch insert, progress tracking; run in background.
+- `app/api/migration_routes.py` — `POST /api/migrations`, `GET /api/migrations/{job_id}`, `GET /api/migrations/{job_id}/status`.
+- `app/static/app.js` — wire Launch button to POST and poll status.
+- `app/main.py` — include migration router; use FastAPI BackgroundTasks/async worker.
+
+**Code that must exist after the phase**:
+- `POST /api/migrations` validates selection, creates a job, kicks off background migration, returns `job_id` immediately.
+- Migration reads via `cursor.fetchmany(MIGRATION_BATCH_SIZE)` and batch-inserts into ClickHouse — never `read_sql` of the whole table.
+- Job statuses PENDING→RUNNING→SUCCESS/FAILED/CANCELLED; metadata tracks job_id, source_schema, source_table, target_database, target_table, status, total_rows, processed_rows, started_at, finished_at, duration_seconds, error_message.
+- `GET /api/migrations/{job_id}` and `/status` reflect live progress.
+
+**Acceptance criteria**: launch from GUI; job id returned immediately; data loads into ClickHouse; batched; browser doesn't block; job status updates; Oracle read-only; CH writes only to `oracle_migration_hazem`.
+
+**Constitution gate (P-V, P-I, P-II, P-VII)**: extraction uses `cursor.fetchmany(MIGRATION_BATCH_SIZE)` (no full-table read, no `pandas.read_sql` of the whole table); Oracle issues only `SELECT`; inserts go only to `oracle_migration_hazem`; source schema/table re-validated against metadata before launch; no secrets in job records or logs.
+
+**Manual test commands**:
+```bash
+JOB=$(curl -s -X POST http://localhost:8000/api/migrations \
+  -H 'Content-Type: application/json' \
+  -d '{"source_schema":"CM","source_table":"COMPONENT","target_table":"CM__COMPONENT","workers":1,"partition_column":null}' | python -c "import sys,json;print(json.load(sys.stdin)['job_id'])")
+curl http://localhost:8000/api/migrations/$JOB
+curl http://localhost:8000/api/migrations/$JOB/status
+```
+
+**Stop point**: Stop after Phase 6 until one full table copies successfully.
+
+---
+
+### Phase 7 — Parallel Migration Engine
+
+**Goal**: Faster migration for large tables via parallel extraction + batch load.
+
+**Scope**: Parallel migration after single-thread is stable. Modes: numeric range, date range, hash fallback.
+
+**Files to create or update**:
+- `app/services/migration_service.py` — add worker pool; numeric-range splitting (`MIN/MAX`, half-open ranges, final range inclusive), date-range splitting, hash mode (`MOD(ORA_HASH(col), :workers) = :id`); aggregate progress; mark job FAILED if any worker fails.
+- `app/config.py` — `MIGRATION_DEFAULT_WORKERS=8`, enforce max 16.
+- `app/api/migration_routes.py` — accept and validate `workers` and partition mode/column.
+- `tests/test_range_split.py` — unit tests proving no overlap/no gaps for numeric and date splits.
+
+**Code that must exist after the phase**:
+- Mode selection: numeric range when numeric column chosen; date range when date/timestamp column chosen; hash mode fallback for non-null high-cardinality column.
+- Per-worker bounded SQL using bind variables; each worker batch-inserts and updates progress.
+- Worker count configurable, default 8, capped at 16; any worker failure → job FAILED.
+
+**Acceptance criteria**: numeric parallel works; date parallel works when date column exists; hash mode works as fallback; worker failures handled; total processed rows tracked; no duplicate/missing ranges for numeric/date.
+
+**Constitution gate (P-V, P-I, P-II, P-VII)**: parallel mode is enabled only after single-thread (Phase 6) is proven; each worker still uses chunked `fetchmany` + batch insert (no full-range load into memory); per-worker `SELECT` bounds use bind variables; worker count is clamped to max 16; all writes remain in `oracle_migration_hazem`; row-count reconciliation (Phase 8) confirms no duplicate/missing rows.
+
+**Manual test commands**:
+```bash
+curl -X POST http://localhost:8000/api/migrations \
+  -H 'Content-Type: application/json' \
+  -d '{"source_schema":"CM","source_table":"COMPONENT","target_table":"CM__COMPONENT","workers":8,"partition_column":"ID","partition_mode":"numeric"}'
+pytest tests/test_range_split.py
+```
+
+**Stop point**: Stop after Phase 7 until parallel migration is tested on small and medium tables.
+
+---
+
+### Phase 8 — Validation, Counts, and Reconciliation
+
+**Goal**: Confirm Oracle and ClickHouse row counts match after migration.
+
+**Scope**: Post-migration validation only.
+
+**Files to create or update**:
+- `app/services/migration_service.py` (or `job_service.py`) — after load, run Oracle `COUNT(*)` and ClickHouse `COUNT(*)`, compute match.
+- Job metadata — add `source_row_count`, `target_row_count`, `count_match`, `validation_status`.
+- `app/api/migration_routes.py` — expose validation fields in job responses.
+- `app/static/app.js` / `index.html` — show counts and match/mismatch.
+
+**Code that must exist after the phase**:
+- Oracle count: `SELECT COUNT(*) FROM <schema>.<table>` (read-only).
+- ClickHouse count: `SELECT COUNT(*) FROM oracle_migration_hazem.<schema>__<table>`.
+- Counts + match stored in job and shown in GUI; mismatch clearly flagged.
+
+**Acceptance criteria**: source count captured; target count captured; count match shown in GUI; validation failure clearly displayed; validation does not modify Oracle.
+
+**Constitution gate (P-I, P-II)**: validation uses only `SELECT COUNT(*)` — read-only on Oracle and read-only on `oracle_migration_hazem`; no other database is queried for writes; no Oracle modification of any kind.
+
+**Manual test commands**:
+```bash
+curl http://localhost:8000/api/migrations/$JOB        # includes source_row_count, target_row_count, count_match, validation_status
+```
+
+**Stop point**: Stop after Phase 8 until reconciliation works.
+
+---
+
+### Phase 9 — Final Docker Compose and Team Run
+
+**Goal**: Make the project easy for a teammate/manager to run from a fresh clone.
+
+**Scope**: Finalize Dockerfile, Docker Compose, README, `.env.example`, logs, troubleshooting.
+
+**Files to create or update**:
+- `Dockerfile`, `docker-compose.yml` (container name `oracle-clickhouse-migration-app`, port 8000, env-file wiring).
+- `README.md` — overview, prerequisites, VPN requirement, `.env` setup, compose run command, health-check commands, GUI usage, Oracle troubleshooting, ClickHouse troubleshooting, security notes.
+- `.env.example` — final, placeholders only.
+
+**Code that must exist after the phase**: No new app logic required; packaging + docs finalized. App reachable at `http://localhost:8000` after `docker compose up -d --build`.
+
+**Acceptance criteria**: fresh clone works with `.env`; compose starts app; health checks work; GUI works; migration works; README clear for another engineer.
+
+**Constitution gate (P-III, P-VII)**: only `.env.example` (placeholders) is committed; the real `.env` stays git-ignored; `Dockerfile`/`docker-compose.yml`/`README` contain no real credentials; README "Security notes" restate the read-only-Oracle and fixed-target rules.
+
+**Manual test commands**:
+```bash
+cp .env.example .env   # fill in real secrets locally (never committed)
+docker compose up -d --build
+curl http://localhost:8000/api/health
+curl http://localhost:8000/api/health/oracle
+curl http://localhost:8000/api/health/clickhouse
+git status --porcelain | grep -E "(^|/)\.env$" && echo "ERROR: .env tracked" || echo ".env not tracked"
+grep -rEi "password|passwd|secret" Dockerfile docker-compose.yml README.md   # expect no real values
+```
+
+**Stop point**: Stop after Phase 9 once a teammate can run it unaided.
+
+---
+
+### Phase 10 — Hardening and Production Readiness
+
+**Goal**: Prepare for controlled production/UAT use.
+
+**Scope**: Add production-quality safety + observability.
+
+**Files to create or update**:
+- `app/main.py` / new `app/api/auth.py` — GUI access protection + (optional) role-based permissions.
+- `app/services/job_service.py` — persistent migration audit table; cancel-job support; retry policy; timeout settings; max row/table size warning.
+- `app/services/report.py` — downloadable migration report.
+- Logging config — structured JSON logging without secrets; app-level rate limiting; pre-migration confirmation popup in GUI.
+
+**Code that must exist after the phase**:
+- Basic access protection on the GUI; auditable migration records; traceable failures; secret-free structured logs; cancel + confirmation; deployment notes in README.
+
+**Acceptance criteria**: app has basic access protection; migration operations auditable; failures traceable; no secrets in logs; production deployment notes documented.
+
+**Constitution gate (P-VII, P-II, P-III)**: structured logs are verified secret-free; if a migration audit table is added it lives only in `oracle_migration_hazem`; any optional rerun operations (TRUNCATE/DROP) remain unimplemented unless explicitly authorized and, if added, are confined to `oracle_migration_hazem`; auth credentials/secrets come only from environment.
+
+**Manual test commands**:
+```bash
+curl -i http://localhost:8000/            # protected resources require auth
+curl -X POST http://localhost:8000/api/migrations/$JOB/cancel
+docker logs oracle-clickhouse-migration-app | grep -Ei "password|passwd|secret" && echo "ERROR: secret in logs" || echo "logs clean"
+```
+
+**Stop point**: Final phase — project complete per PLAN.md §21 Definition of Done.
+
+## Complexity Tracking
+
+No constitution violations to justify; this section is intentionally empty.

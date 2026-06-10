@@ -1,0 +1,89 @@
+# Phase 1 Data Model: Oracle to ClickHouse Parallel Data Migration Engine
+
+This describes the conceptual entities the application manipulates. Source-side entities are read-only Oracle metadata; target-side entities live in ClickHouse `oracle_migration_hazem`; job entities live in the app's in-memory registry (Phases 6–8) and optionally a persistent audit table (Phase 10).
+
+## OracleSchema (read-only, discovered)
+Represents a distinct Oracle owner that has tables.
+- `owner` (string) — schema/owner name. **Identity.**
+- **Source**: `SELECT DISTINCT owner FROM all_tables ORDER BY owner`.
+- **Validation**: a user-supplied schema must exist in this set before use.
+
+## OracleTable (read-only, discovered)
+A table within a schema; the unit selected for migration.
+- `owner` (string) — parent schema.
+- `table_name` (string). **Identity** = (`owner`, `table_name`).
+- **Source**: `SELECT table_name FROM all_tables WHERE owner = :schema_name ORDER BY table_name`.
+- **Validation**: must exist for the given owner before any column/DDL/migration operation.
+
+## OracleColumn (read-only, discovered)
+A column of a source table, used for DDL generation and partition-candidate detection.
+- `column_name` (string)
+- `data_type` (string) — e.g., NUMBER, VARCHAR2, DATE, TIMESTAMP(6)
+- `data_length` (int, nullable)
+- `data_precision` (int, nullable)
+- `data_scale` (int, nullable)
+- `nullable` (string Y/N)
+- **Source**: `all_tab_columns` ordered by `column_id`.
+- **Derived**: maps to a ClickHouse type via the type-mapping rules; see `contracts/clickhouse-ddl.md`.
+
+## PartitionCandidate (derived view of OracleColumn)
+Columns eligible to drive parallelism / target ordering.
+- Same fields as OracleColumn (subset).
+- **Rule**: `data_type IN ('NUMBER','DATE') OR data_type LIKE 'TIMESTAMP%'`.
+- **Mode mapping**: NUMBER → numeric range; DATE/TIMESTAMP% → date range; any non-null high-cardinality column → hash fallback.
+
+## TargetTable (ClickHouse, created)
+The destination table in `oracle_migration_hazem`.
+- `database` (string) — **always** `oracle_migration_hazem` (fixed/validated).
+- `name` (string) — `<source_schema>__<source_table>` by default, or `<target_schema>__<target_table>` when customized.
+- `columns` — derived from OracleColumn list via type mapping; all `Nullable(...)`.
+- `engine` — `MergeTree`.
+- `order_by` — chosen partition/order column, or `tuple()` when none.
+- **Validation**: database must equal `oracle_migration_hazem`; reject any other value. Created with `CREATE TABLE IF NOT EXISTS`.
+
+## MigrationJob (app state)
+A unit of background migration work.
+- `job_id` (string/UUID) — **Identity.**
+- `source_schema` (string)
+- `source_table` (string)
+- `target_database` (string, = `oracle_migration_hazem`)
+- `target_table` (string)
+- `partition_column` (string, nullable)
+- `partition_mode` (enum: `single` | `numeric` | `date` | `hash`)
+- `workers` (int, default 8, 1..16)
+- `status` (enum: `PENDING` | `RUNNING` | `SUCCESS` | `FAILED` | `CANCELLED`)
+- `total_rows` (int, nullable)
+- `processed_rows` (int)
+- `started_at` (timestamp, nullable)
+- `finished_at` (timestamp, nullable)
+- `duration_seconds` (number, nullable)
+- `error_message` (string, nullable)
+- Validation fields (Phase 8): `source_row_count`, `target_row_count`, `count_match` (bool), `validation_status` (enum: `PENDING` | `MATCH` | `MISMATCH`)
+
+### State transitions
+```
+PENDING ──launch──▶ RUNNING ──all rows loaded & counts match──▶ SUCCESS
+   │                   │
+   │                   ├── any worker error / load error ─────▶ FAILED
+   │                   └── cancel requested (Phase 10) ───────▶ CANCELLED
+   └── invalid selection at creation ─────────────────────────▶ (rejected, no job)
+```
+Validation runs after load completes (Phase 8); `validation_status` becomes `MATCH` or `MISMATCH`. A `MISMATCH` is surfaced in the GUI but does not by itself change `status` from SUCCESS unless policy later dictates otherwise.
+
+## Worker (transient, Phase 7)
+A parallel extraction+load unit operating on one slice.
+- `worker_id` (int, 0..workers-1)
+- `slice` — numeric `[start, end)` (final inclusive), date `[start, end)` (final inclusive), or hash bucket `MOD(ORA_HASH(col), workers) = worker_id`.
+- `processed_rows` (int) — contributes to the job's aggregate `processed_rows`.
+- **Rule**: any worker failure marks the parent job `FAILED`.
+
+## ValidationResult (embedded in MigrationJob, Phase 8)
+- `source_row_count` (int) — `SELECT COUNT(*) FROM <schema>.<table>` (read-only).
+- `target_row_count` (int) — `SELECT COUNT(*) FROM oracle_migration_hazem.<schema>__<table>`.
+- `count_match` (bool) — `source_row_count == target_row_count`.
+- `validation_status` (enum) — see above.
+
+## AuditRecord (persistent, Phase 10 — optional)
+Durable record of each migration for traceability.
+- Mirrors MigrationJob terminal fields plus actor/initiator and timestamps.
+- Stored in `oracle_migration_hazem` (e.g., a `_migration_audit` table) or app-side store; never contains credentials.
