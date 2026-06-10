@@ -680,7 +680,7 @@ curl "http://localhost:8000/api/oracle/tables?schema=CM"
 ```
 
 ```bash
-curl "http://localhost:8000/api/oracle/columns?schema=CM&table=COMPONENT"
+curl "http://localhost:8000/api/oracle/columns?schema=CM&table=CROSS_REP_TYPE"
 ```
 
 ## Stop Point

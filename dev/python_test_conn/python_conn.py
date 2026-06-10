@@ -1,8 +1,13 @@
+import os
+
 import oracledb
 
-user = "admin"
-password = "SiliconDba23"
-dsn = "p5-ora-quality.cdyue4j7h7u5.us-east-1.rds.amazonaws.com:1521/quality"
+user = os.getenv("P5_QA_ORACLE_USER", "")
+password = os.getenv("P5_QA_ORACLE_PASSWORD", "")
+dsn = os.getenv("P5_QA_ORACLE_DSN", "")
+
+if not user or not password or not dsn:
+    raise RuntimeError("Oracle test connection requires environment variables")
 
 try:
     with oracledb.connect(user=user, password=password, dsn=dsn) as conn:

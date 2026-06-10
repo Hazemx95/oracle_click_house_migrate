@@ -1,0 +1,9 @@
+services:
+  app:
+    build:
+      context: .
+    container_name: oracle-clickhouse-migration-app
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"

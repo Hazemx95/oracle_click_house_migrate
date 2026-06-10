@@ -1,0 +1,32 @@
+.git/
+Dockerfile*
+.dockerignore
+
+# Local secrets must never enter the image build context.
+.env
+.env.*
+*.env
+!.env.example
+
+# Python/local runtime artifacts
+oracle_click-house_venv/
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+dist/
+build/
+*.egg-info/
+
+# Logs and coverage
+*.log*
+coverage/
+
+# Editor/system files
+.DS_Store
+Thumbs.db
+*.tmp
+*.swp
+.vscode/
+.idea/

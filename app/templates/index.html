@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Oracle to ClickHouse Migration Engine</title>
+    <link rel="stylesheet" href="{{ url_for('static', path='style.css') }}">
+  </head>
+  <body>
+    <main class="page">
+      <section class="hero">
+        <p class="eyebrow">Phase 1 Skeleton</p>
+        <h1>Oracle to ClickHouse Migration Engine</h1>
+        <p class="summary">
+          Base application shell for the phased migration tool. Database health,
+          metadata discovery, migration execution, and parallel workers are added
+          in later phases.
+        </p>
+        <div class="status-card" id="app-shell">
+          <h2>Service Health</h2>
+          <p>Use <code>GET /api/health</code> to verify the app is running.</p>
+        </div>
+      </section>
+    </main>
+    <script src="{{ url_for('static', path='app.js') }}"></script>
+  </body>
+</html>
