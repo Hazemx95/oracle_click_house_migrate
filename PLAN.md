@@ -687,7 +687,120 @@ curl "http://localhost:8000/api/oracle/columns?schema=CM&table=CROSS_REP_TYPE"
 
 Stop after Phase 3. Do not continue until metadata APIs work correctly.
 
+
 ---
+## Initial Full Load and Flask Integration Requirement
+
+This project implements initial full load only.
+
+CDC, incremental loading, watermark logic, deduplication, merge/upsert, append-only duplicate loading, and staging-table logic are not part of this project.
+
+CDC and incremental logic will be handled by another team.
+
+### Required Initial Load Behavior
+
+When the user clicks Launch / Replicate, the application must:
+
+1. Read Oracle metadata.
+2. Drop the target ClickHouse table if it already exists.
+3. Create a new empty ClickHouse target table using Oracle-to-ClickHouse data type mapping.
+4. Extract all rows from Oracle using batch/chunked reads.
+5. Insert all rows into ClickHouse using batch inserts.
+6. Track job status, processed rows, and errors.
+
+### Repeated Execution Behavior
+
+If the same Oracle schema/table is launched again:
+
+1. Drop the existing ClickHouse target table.
+2. Recreate the target table.
+3. Load the full Oracle source table again.
+
+The final ClickHouse table must contain only the latest full load result.
+
+The application must not append duplicate full copies.
+
+Example:
+
+First run:
+
+* Oracle table has 100 rows.
+* ClickHouse target table is created and loaded with 100 rows.
+
+Second run:
+
+* Existing ClickHouse target table is dropped.
+* Target table is recreated.
+* Oracle table is fully loaded again.
+* Final ClickHouse target table has 100 rows, not 200 rows.
+
+### Out of Scope
+
+The application must not implement:
+
+* CDC
+* Incremental loading
+* Watermark filtering
+* Deduplication
+* Merge/upsert
+* Staging table replacement
+* Append-only duplicate loading
+* Skip-existing-row logic
+
+### Oracle Safety
+
+Oracle remains read-only.
+
+The application can only execute SELECT statements against Oracle.
+
+### ClickHouse Safety
+
+ClickHouse write operations are allowed only inside:
+
+`oracle_migration_hazem`
+
+Allowed ClickHouse operations for this project:
+
+* DROP TABLE IF EXISTS inside `oracle_migration_hazem`
+* CREATE TABLE inside `oracle_migration_hazem`
+* INSERT INTO inside `oracle_migration_hazem`
+* SELECT inside `oracle_migration_hazem`
+
+Target table format:
+
+`oracle_migration_hazem.<source_schema>__<source_table>`
+
+Example:
+
+`oracle_migration_hazem.CM__COMPONENT`
+
+### Flask Integration Requirement
+
+The migration code must be easy to integrate into an existing Flask application.
+
+Business logic must be reusable and must not be tightly coupled to FastAPI.
+
+The real logic must live in service modules:
+
+* `app/services/metadata_service.py`
+* `app/services/ddl_mapper.py`
+* `app/services/migration_service.py`
+* `app/services/job_service.py`
+* `app/db/oracle_client.py`
+* `app/db/clickhouse_client.py`
+
+FastAPI route files must only call service-layer functions.
+
+The future Flask app should be able to import the service layer directly.
+
+Example future Flask usage:
+
+```python
+from app.services.migration_service import launch_initial_load
+from app.services.metadata_service import get_oracle_tables
+```
+---
+
 
 # 12. Phase 4 — GUI Dynamic Dropdowns
 

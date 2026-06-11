@@ -9,17 +9,92 @@
   <body>
     <main class="page">
       <section class="hero">
-        <p class="eyebrow">Phase 1 Skeleton</p>
+        <!-- <p class="eyebrow">Phase 4 GUI Dynamic Dropdowns</p> -->
         <h1>Oracle to ClickHouse Migration Engine</h1>
         <p class="summary">
-          Base application shell for the phased migration tool. Database health,
-          metadata discovery, migration execution, and parallel workers are added
-          in later phases.
+          Select an Oracle source table, review the fixed ClickHouse target, and
+          prepare an initial full load. Migration execution is added in a later phase.
         </p>
-        <div class="status-card" id="app-shell">
-          <h2>Service Health</h2>
-          <p>Use <code>GET /api/health</code> to verify the app is running.</p>
-        </div>
+
+        <section class="status-grid" aria-label="Database health">
+          <article class="status-card" id="oracle-health">
+            <span class="status-dot" aria-hidden="true"></span>
+            <div>
+              <h2>Oracle Health</h2>
+              <p data-status-text>Checking Oracle connection...</p>
+            </div>
+          </article>
+          <article class="status-card" id="clickhouse-health">
+            <span class="status-dot" aria-hidden="true"></span>
+            <div>
+              <h2>ClickHouse Health</h2>
+              <p data-status-text>Checking ClickHouse connection...</p>
+            </div>
+          </article>
+        </section>
+
+        <form class="migration-form" id="migration-form">
+          <fieldset>
+            <legend>Oracle Source</legend>
+            <div class="form-grid">
+              <label for="source-schema">
+                Oracle Source Schema
+                <select id="source-schema" name="source_schema" required>
+                  <option value="">Loading schemas...</option>
+                </select>
+              </label>
+
+              <label for="source-table">
+                Oracle Source Table
+                <select id="source-table" name="source_table" required disabled>
+                  <option value="">Select a schema first</option>
+                </select>
+              </label>
+
+              <label for="partition-column">
+                Partition/Hash Column
+                <select id="partition-column" name="partition_column" disabled>
+                  <option value="">Select a table first</option>
+                </select>
+              </label>
+
+              <label for="worker-threads">
+                Worker Threads
+                <input id="worker-threads" name="workers" type="number" min="1" max="16" value="8">
+              </label>
+            </div>
+          </fieldset>
+
+          <fieldset>
+            <legend>ClickHouse Target</legend>
+            <div class="form-grid">
+              <label for="target-schema">
+                ClickHouse Schema Destination
+                <input id="target-schema" name="target_schema" type="text" placeholder="Auto-filled from source schema">
+              </label>
+
+              <label for="clickhouse-database">
+                ClickHouse Database
+                <input id="clickhouse-database" name="target_database" type="text" value="oracle_migration_hazem" disabled>
+              </label>
+
+              <label for="target-table">
+                Target Table Name
+                <input id="target-table" name="target_table" type="text" placeholder="Auto-filled from source table" required>
+              </label>
+            </div>
+          </fieldset>
+
+          <div class="launch-panel">
+            <p class="load-note">
+              initial full load. Launching will drop and recreate
+              the target table in <code>oracle_migration_hazem</code>, then load the
+              entire Oracle table. No append, no incremental mode, no CDC, and no watermark logic.
+            </p>
+            <button type="button" id="launch-button" disabled>Launch Initial Load </button>
+            <p class="launch-message" id="launch-message" role="status" aria-live="polite"></p>
+          </div>
+        </form>
       </section>
     </main>
     <script src="{{ url_for('static', path='app.js') }}"></script>
