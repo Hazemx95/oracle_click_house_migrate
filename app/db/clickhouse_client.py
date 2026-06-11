@@ -1,4 +1,5 @@
 from typing import Any
+import re
 
 from app.config import TARGET_DATABASE, Settings, get_settings
 
@@ -12,6 +13,14 @@ CLICKHOUSE_CONNECT_QUERY = "SELECT 1"
 CLICKHOUSE_TARGET_DATABASE_QUERY = (
     "SELECT name FROM system.databases "
     "WHERE name = {database:String}"
+)
+
+_IDENTIFIER = r"(?:`[A-Za-z_][A-Za-z0-9_]*`|[A-Za-z_][A-Za-z0-9_]*)"
+_TARGET = rf"(?P<db>{_IDENTIFIER})\.(?P<table>{_IDENTIFIER})"
+_DROP_DDL_RE = re.compile(rf"^DROP\s+TABLE\s+IF\s+EXISTS\s+{_TARGET}$", re.IGNORECASE)
+_CREATE_DDL_RE = re.compile(
+    rf"^CREATE\s+TABLE\s+(?!IF\s+NOT\s+EXISTS){_TARGET}\s*\(",
+    re.IGNORECASE,
 )
 
 
@@ -47,6 +56,43 @@ def target_database_exists(client: Any | None = None) -> bool:
             parameters={"database": TARGET_DATABASE},
         )
         return bool(_rows(result))
+    finally:
+        if close_client and hasattr(client, "close"):
+            client.close()
+
+
+def _unquote_identifier(identifier: str) -> str:
+    if identifier.startswith("`") and identifier.endswith("`"):
+        return identifier[1:-1]
+    return identifier
+
+
+def _assert_allowed_ddl(ddl: str) -> str:
+    statement = ddl.strip()
+    if statement.endswith(";"):
+        statement = statement[:-1].strip()
+    if ";" in statement:
+        raise ValueError("ClickHouse DDL must contain a single statement")
+
+    match = _DROP_DDL_RE.match(statement) or _CREATE_DDL_RE.match(statement)
+    if not match:
+        raise ValueError("ClickHouse DDL must be DROP TABLE IF EXISTS or CREATE TABLE")
+
+    database = _unquote_identifier(match.group("db"))
+    if database != TARGET_DATABASE:
+        raise ValueError(f"target database must be '{TARGET_DATABASE}'")
+    return statement
+
+
+def execute_ddl(ddl: str, client: Any | None = None) -> None:
+    statement = _assert_allowed_ddl(ddl)
+    close_client = client is None
+    client = client or get_client()
+    try:
+        if hasattr(client, "command"):
+            client.command(statement)
+        else:
+            client.query(statement)
     finally:
         if close_client and hasattr(client, "close"):
             client.close()

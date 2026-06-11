@@ -41,8 +41,8 @@ def test_list_columns_uses_schema_and_table_bind_variables(monkeypatch) -> None:
     def fake_run_select(sql: str, binds: dict[str, Any] | None = None) -> list[tuple[Any, ...]]:
         calls.append((sql, binds))
         return [
-            ("ID", "NUMBER", 22, 10, 0, "N"),
-            ("NAME", "VARCHAR2", 100, None, None, "Y"),
+            ("ID", "NUMBER", 22, 10, 0, "N", None, None),
+            ("NAME", "VARCHAR2", 100, None, None, "Y", 100, "B"),
         ]
 
     monkeypatch.setattr(metadata_service.oracle_client, "run_select", fake_run_select)
@@ -55,6 +55,8 @@ def test_list_columns_uses_schema_and_table_bind_variables(monkeypatch) -> None:
             "data_precision": 10,
             "data_scale": 0,
             "nullable": "N",
+            "char_length": None,
+            "char_used": None,
         },
         {
             "column_name": "NAME",
@@ -63,6 +65,8 @@ def test_list_columns_uses_schema_and_table_bind_variables(monkeypatch) -> None:
             "data_precision": None,
             "data_scale": None,
             "nullable": "Y",
+            "char_length": 100,
+            "char_used": "B",
         },
     ]
     assert calls[0][1] == {"schema_name": "CM", "table_name": "COMPONENT"}
@@ -116,6 +120,8 @@ def test_oracle_metadata_routes_return_expected_payloads(monkeypatch) -> None:  
                 "data_precision": 10,
                 "data_scale": 0,
                 "nullable": "N",
+                "char_length": None,
+                "char_used": None,
             }
         ],
     )
@@ -149,6 +155,8 @@ def test_oracle_metadata_routes_return_expected_payloads(monkeypatch) -> None:  
                 "data_precision": 10,
                 "data_scale": 0,
                 "nullable": "N",
+                "char_length": None,
+                "char_used": None,
             }
         ],
     }

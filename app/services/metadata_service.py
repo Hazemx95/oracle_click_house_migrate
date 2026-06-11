@@ -36,7 +36,9 @@ SELECT
     data_length,
     data_precision,
     data_scale,
-    nullable
+    nullable,
+    char_length,
+    char_used
 FROM all_tab_columns
 WHERE owner = :schema_name
   AND table_name = :table_name
@@ -135,6 +137,8 @@ def list_columns(schema: str, table: str) -> list[dict[str, Any]]:
             "data_precision": _column(row, 3, "data_precision"),
             "data_scale": _column(row, 4, "data_scale"),
             "nullable": _column(row, 5, "nullable"),
+            "char_length": _column(row, 6, "char_length"),
+            "char_used": _column(row, 7, "char_used"),
         }
         for row in rows
     ]

@@ -855,13 +855,181 @@ Phase 4 is complete only when:
 
 Stop after Phase 4. Do not continue until GUI dynamic behavior works.
 
----
+--
+## Phase 5/6 Critical Gate — Type Mapping and Migration Performance
 
+Before implementing migration logic, the project must strengthen two critical areas:
+
+1. Oracle-to-ClickHouse data type mapping.
+2. High-performance full-load migration from Oracle to ClickHouse.
+
+### Data Type Mapping Requirements
+
+The mapper must be implemented in:
+
+`app/services/ddl_mapper.py`
+
+The mapper must be framework-agnostic and reusable from another Flask application.
+
+The mapper must inspect Oracle column metadata from `ALL_TAB_COLUMNS`, including:
+
+- column_name
+- data_type
+- data_length
+- data_precision
+- data_scale
+- nullable
+- char_length
+- char_used
+
+The mapper must generate safe ClickHouse column definitions.
+
+All ClickHouse identifiers must be safely quoted.
+
+Unsupported Oracle types must not crash the application. They must fallback to `Nullable(String)` and return a warning in the DDL preview.
+
+### Required Oracle to ClickHouse Mapping
+
+Recommended mapping:
+
+| Oracle Type | ClickHouse Type |
+|---|---|
+| NUMBER(p,0), p <= 18 | Nullable(Int64) |
+| NUMBER(p,0), p > 18 and p <= 76 | Nullable(Decimal(p,0)) |
+| NUMBER(p,s), s > 0 and p <= 76 | Nullable(Decimal(p,s)) |
+| NUMBER with unknown precision/scale | Nullable(Float64) |
+| FLOAT | Nullable(Float64) |
+| BINARY_FLOAT | Nullable(Float32) |
+| BINARY_DOUBLE | Nullable(Float64) |
+| VARCHAR2 | Nullable(String) |
+| NVARCHAR2 | Nullable(String) |
+| CHAR | Nullable(String) |
+| NCHAR | Nullable(String) |
+| CLOB | Nullable(String) |
+| NCLOB | Nullable(String) |
+| DATE | Nullable(DateTime) |
+| TIMESTAMP | Nullable(DateTime64(6)) |
+| TIMESTAMP WITH TIME ZONE | Nullable(DateTime64(6)) |
+| TIMESTAMP WITH LOCAL TIME ZONE | Nullable(DateTime64(6)) |
+| RAW | Nullable(String) |
+| BLOB | Nullable(String) |
+| Unsupported type | Nullable(String) with warning |
+
+### Nullability Rule
+
+If Oracle column is nullable, use `Nullable(...)`.
+
+If Oracle column is not nullable, the mapper may use the non-nullable ClickHouse type.
+
+For the first stable implementation, prefer safe nullable mapping unless the column is selected as a non-null ordering key.
+
+### ORDER BY Rule
+
+Use:
+
+`ENGINE = MergeTree`
+
+If the selected partition/hash/order column is safe, non-nullable, and supported by ClickHouse, use:
+
+`ORDER BY <column>`
+
+Otherwise use:
+
+`ORDER BY tuple()`
+
+Do not use a nullable column as ORDER BY unless explicitly handled safely.
+
+### Performance Requirements for Migration
+
+The migration engine must be memory-safe and fast.
+
+The migration engine must never load the full Oracle table into Python memory.
+
+Forbidden:
+
+```python
+pandas.read_sql("SELECT * FROM huge_table", conn)
+cursor.fetchall()
+row_by_row_insert()
+```
+
+## Live Migration Progress and Worker Status UI
+
+The GUI must show live migration progress after the user launches a migration.
+
+### Required GUI Status Features
+
+The page must include:
+
+- Overall progress bar from 0% to 100%.
+- Current job status: PENDING, RUNNING, SUCCESS, FAILED, CANCELLED.
+- Total source rows.
+- Processed rows.
+- Inserted rows.
+- Remaining rows.
+- Elapsed time.
+- Rows per second.
+- Current batch number.
+- Error message if failed.
+
+### Parallel Worker Progress
+
+When parallel migration is enabled, the GUI must show one row/card per worker.
+
+Each worker status must include:
+
+- worker_id
+- partition_mode
+- partition_column
+- range_start
+- range_end
+- status
+- processed_rows
+- inserted_rows
+- batches_completed
+- rows_per_second
+- error_message
+
+### API Requirement
+
+`GET /api/migrations/{job_id}/status` must return both overall progress and per-worker progress.
+
+Example response:
+
+```json
+{
+  "job_id": "uuid",
+  "status": "RUNNING",
+  "source_schema": "CM",
+  "source_table": "COMPONENT",
+  "target_table": "CM__COMPONENT",
+  "total_rows": 1000000,
+  "processed_rows": 450000,
+  "inserted_rows": 450000,
+  "remaining_rows": 550000,
+  "progress_percent": 45.0,
+  "elapsed_seconds": 60,
+  "rows_per_second": 7500,
+  "workers": [
+    {
+      "worker_id": 1,
+      "status": "RUNNING",
+      "processed_rows": 120000,
+      "inserted_rows": 120000,
+      "batches_completed": 2,
+      "rows_per_second": 3000,
+      "range_start": 1,
+      "range_end": 250000
+    }
+  ]
+}
+```
 # 13. Phase 5 — ClickHouse DDL Generation
 
 ## Goal
 
-Generate and execute ClickHouse `CREATE TABLE IF NOT EXISTS` based on Oracle table metadata.
+Generate and execute ClickHouse `DROP TABLE IF EXISTS 
+CREATE TABLE` based on Oracle table metadata.
 
 ## Scope
 
@@ -984,7 +1152,7 @@ When user launches migration:
 
 1. Validate source schema/table from Oracle metadata.
 2. Validate target database is `oracle_migration_hazem`.
-3. Create target ClickHouse table if not exists.
+3. Drop target ClickHouse table if it exists, then create a fresh empty target table.
 4. Read Oracle rows using `fetchmany(batch_size)`.
 5. Insert rows into ClickHouse using batch insert.
 6. Track total rows and processed rows.

@@ -313,26 +313,49 @@ curl -s http://localhost:8000/ | grep -i "oracle_migration_hazem"   # fixed DB p
 
 ---
 
-### Phase 5 — ClickHouse DDL Generation
+### Phase 5 — ClickHouse DDL Generation **(Critical DDL & Type-Mapping Gate)**
 
-**Goal**: Generate and execute a **drop-and-recreate** target DDL pair (`DROP TABLE IF EXISTS` then `CREATE TABLE`) in `oracle_migration_hazem` from Oracle metadata, so each launch starts from a fresh empty target. No idempotent `IF NOT EXISTS` create — the full-load model requires the table to be replaced, not preserved.
+**Goal**: Generate and execute a **drop-and-recreate** target DDL pair (`DROP TABLE IF EXISTS` then `CREATE TABLE`) in `oracle_migration_hazem` from Oracle metadata, so each launch starts from a fresh empty target. No idempotent `IF NOT EXISTS` create — the full-load model requires the table to be replaced, not preserved. This phase is the **critical gate**: data migration (Phase 6+) must not begin until the type mapping, identifier quoting, and drop+create generation are proven correct here.
 
-**Scope**: Type mapping, safe target naming, drop+create DDL generation, target-DB enforcement. No data migration yet.
+**Scope**: Type mapping, safe target naming, safe identifier quoting, drop+create DDL generation, target-DB enforcement, unsupported-type fallback with warnings. No data migration yet.
+
+**Framework-agnostic requirement (hard gate)**: `app/services/ddl_mapper.py` MUST contain **no FastAPI imports** and no dependency on FastAPI request/response objects — only pure functions over plain Python structures (column metadata dicts/dataclasses → DDL strings/warnings). A future Flask app must be able to `from app.services.ddl_mapper import ...` directly. The route layer (`app/api/clickhouse_routes.py`) is a thin wrapper that only adapts HTTP ↔ service calls.
 
 **Files to create or update**:
-- `app/services/ddl_mapper.py` — Oracle→ClickHouse type map (PLAN.md §13), safe-name builder `<schema>__<table>`, engine selection (`ORDER BY <col>` or `ORDER BY tuple()`), **DROP and CREATE** DDL string builders, target-DB guard. Pure functions, framework-agnostic, importable by a future Flask app.
-- `app/api/clickhouse_routes.py` — `POST /api/clickhouse/create-table-preview` (returns both the DROP and CREATE statements), `POST /api/clickhouse/create-table` (executes DROP then CREATE).
+- `app/services/ddl_mapper.py` — Oracle→ClickHouse type map (table below), safe-name builder `<schema>__<table>`, **safe ClickHouse identifier quoting** (backtick-quote every identifier; reject/escape backticks and control chars), engine selection (`ORDER BY <col>` or `ORDER BY tuple()`), **DROP and CREATE** DDL string builders, target-DB guard (enforce `oracle_migration_hazem`), unsupported-type fallback that returns a structured warning list. Pure functions, **no FastAPI imports**, importable by a future Flask app.
+- `app/api/clickhouse_routes.py` — `POST /api/clickhouse/create-table-preview` (returns the DROP + CREATE statements **and any type-mapping warnings**), `POST /api/clickhouse/create-table` (executes DROP then CREATE). Thin wrapper only.
 - `app/db/clickhouse_client.py` — `execute_ddl` confined to target DB; rejects any statement whose target is not `oracle_migration_hazem`.
 - `app/main.py` — include clickhouse router.
-- `tests/test_ddl_mapper.py` — unit tests for mapping + naming + unsupported-type fallback + that the generated DDL is a DROP-then-CREATE pair (no `IF NOT EXISTS` on CREATE).
+- `tests/test_ddl_mapper.py` — **comprehensive** unit tests for every mapping branch (NUMBER precision/scale boundaries, FLOAT/BINARY_FLOAT/BINARY_DOUBLE, char types incl. NCLOB, DATE, TIMESTAMP variants, RAW/BLOB), unsupported-type fallback + warning emission, identifier quoting/injection safety, naming, and that the generated DDL is a DROP-then-CREATE pair (no `IF NOT EXISTS` on CREATE).
+
+**Oracle metadata fields consumed** (from `ALL_TAB_COLUMNS`): `column_name`, `data_type`, `data_length`, `data_precision`, `data_scale`, `nullable`, `char_length`, `char_used`. (`char_length`/`char_used` are added in this phase to disambiguate char-semantics columns; the Phase 3 columns endpoint is extended to also return them if not already present.)
+
+**Required Oracle → ClickHouse mapping** (authoritative for this project):
+
+| Oracle type | Condition | ClickHouse type |
+| --- | --- | --- |
+| `NUMBER(p,0)` | `p <= 18` | `Nullable(Int64)` |
+| `NUMBER(p,0)` | `18 < p <= 76` | `Nullable(Decimal(p,0))` |
+| `NUMBER(p,s)` | `s > 0` and `p <= 76` | `Nullable(Decimal(p,s))` |
+| `NUMBER` | unknown precision/scale | `Nullable(Float64)` |
+| `FLOAT` | — | `Nullable(Float64)` |
+| `BINARY_FLOAT` | — | `Nullable(Float32)` |
+| `BINARY_DOUBLE` | — | `Nullable(Float64)` |
+| `VARCHAR2` / `NVARCHAR2` / `CHAR` / `NCHAR` / `CLOB` / `NCLOB` | — | `Nullable(String)` |
+| `DATE` | — | `Nullable(DateTime)` |
+| `TIMESTAMP` / `TIMESTAMP WITH TIME ZONE` / `TIMESTAMP WITH LOCAL TIME ZONE` | — | `Nullable(DateTime64(6))` |
+| `RAW` / `BLOB` | — | `Nullable(String)` |
+| any other / unsupported | — | `Nullable(String)` **+ warning** |
 
 **Code that must exist after the phase**:
-- Type mapping incl. NUMBER scale 0 → `Nullable(Int64)`, NUMBER scale>0 → `Nullable(Float64)`, VARCHAR2/NVARCHAR2/CHAR/NCHAR/CLOB → `Nullable(String)`, DATE → `Nullable(DateTime)`, TIMESTAMP → `Nullable(DateTime64(6))`, FLOAT → `Nullable(Float64)`, BINARY_FLOAT → `Nullable(Float32)`, BINARY_DOUBLE → `Nullable(Float64)`, default `Nullable(String)`.
-- Preview endpoint returns DDL text (both `DROP TABLE IF EXISTS oracle_migration_hazem.<schema>__<table>` and the `CREATE TABLE` statement) without executing.
+- The mapping above implemented exactly, including the `NUMBER` precision/scale boundaries (`p <= 18` → Int64; `Decimal(p,0)` for `18 < p <= 76`; `Decimal(p,s)` for `s > 0`; `Float64` when precision/scale are null/unknown), TIMESTAMP-with-zone variants, and RAW/BLOB → `Nullable(String)`.
+- Unsupported Oracle types **do not crash**: they fall back to `Nullable(String)` and the mapper returns a warning entry (column name + original Oracle type) that the preview endpoint surfaces.
+- All ClickHouse identifiers (database, table, column names) are **safely quoted** so a hostile/odd identifier cannot inject DDL.
+- Preview endpoint returns DDL text (both `DROP TABLE IF EXISTS oracle_migration_hazem.<schema>__<table>` and the `CREATE TABLE` statement) plus the warnings list, **without executing**.
 - Create endpoint executes, in order: `DROP TABLE IF EXISTS oracle_migration_hazem.<schema>__<table>` then `CREATE TABLE oracle_migration_hazem.<schema>__<table> (...) ENGINE = MergeTree ORDER BY ...` — yielding a fresh empty table even when one already existed.
-- Dangerous/other target-database values rejected (DROP and CREATE both guarded); unsupported types fall back to `Nullable(String)` and do not crash.
+- Target-database enforcement: any value other than `oracle_migration_hazem` is rejected for **both** DROP and CREATE.
 
-**Acceptance criteria**: DDL preview shows the drop+create pair; executing it produces a fresh empty table even on re-run; both DROP and CREATE act only in `oracle_migration_hazem`; Oracle not modified; unsupported types do not crash; dangerous target values rejected for both DROP and CREATE.
+**Acceptance criteria**: DDL preview shows the drop+create pair and any mapping warnings; executing it produces a fresh empty table even on re-run; both DROP and CREATE act only in `oracle_migration_hazem`; Oracle not modified; every mapping branch (incl. Decimal boundaries, TIMESTAMP-with-zone, RAW/BLOB, NCLOB) is covered by `tests/test_ddl_mapper.py`; unsupported types fall back to `Nullable(String)` with a warning and do not crash; identifiers are safely quoted; `ddl_mapper.py` imports no FastAPI; dangerous target values rejected for both DROP and CREATE.
 
 **Constitution gate (P-II, P-I, P-VII)**: the only ClickHouse statements executed are `DROP TABLE IF EXISTS` and `CREATE TABLE` inside `oracle_migration_hazem` (the explicitly authorized rerun behavior); the target-DB guard rejects any other database value on **both** statements; Oracle is touched only for read-only column metadata; identifiers are sanitized/quoted so DDL cannot be injected.
 
@@ -369,22 +392,34 @@ pytest tests/test_ddl_mapper.py
 **Scope**: Single-thread full-load replace only. No parallel workers. No CDC, incremental, watermark, dedup, merge/upsert, staging swap, append, or skip-existing logic.
 
 **Files to create or update**:
-- `app/services/job_service.py` — in-memory job registry; create/get/update; status + progress fields.
-- `app/services/migration_service.py` — single-thread full-load pipeline exposing a framework-agnostic entry point (e.g. `launch_initial_load(...)`): (1) validate source schema/table against Oracle metadata; (2) confirm target DB is `oracle_migration_hazem`; (3) **DROP** target table if it exists then **CREATE** it fresh (via `ddl_mapper`); (4) `fetchmany(batch_size)` loop over the full Oracle source; (5) batch insert each chunk; (6) progress tracking. Run in background. No coupling to FastAPI types so a Flask app can call it directly.
+- `app/services/job_service.py` — in-memory job registry; create/get/update; status + **full progress fields** (see below). Framework-agnostic, no FastAPI imports.
+- `app/services/migration_service.py` — single-thread full-load pipeline exposing a framework-agnostic entry point (e.g. `launch_initial_load(...)`): (1) validate source schema/table against Oracle metadata; (2) confirm target DB is `oracle_migration_hazem`; (3) **DROP** target table if it exists then **CREATE** it fresh (via `ddl_mapper`); (4) batch read loop over the full Oracle source; (5) batch insert each chunk with explicit column names in a stable order; (6) progress tracking. Run in background. **No FastAPI imports / no coupling to FastAPI request/response types** so a Flask app can call it directly.
 - `app/api/migration_routes.py` — thin wrappers only: `POST /api/migrations`, `GET /api/migrations/{job_id}`, `GET /api/migrations/{job_id}/status`.
-- `app/static/app.js` — wire Launch/Replicate button to POST and poll status; surface that each launch replaces the target.
+- `app/static/app.js` + `app/templates/index.html` — wire Launch/Replicate button to POST and poll `/status`; render the **live progress UI** (see below); surface that each launch replaces the target.
 - `app/main.py` — include migration router; use FastAPI BackgroundTasks/async worker.
+
+**Performance rules (mandatory — memory-safe, batched, never row-by-row)**:
+- **Never** use `pandas.read_sql` for full-table migration.
+- **Never** use `cursor.fetchall()` for huge tables.
+- **Never** insert row-by-row into ClickHouse.
+- Set `cursor.arraysize` and `cursor.prefetchrows` to tune Oracle round-trips.
+- Extract with `cursor.fetchmany(MIGRATION_BATCH_SIZE)` in a loop.
+- Insert into ClickHouse with **batch inserts**, using **explicit column names** and a **stable column order** (the order returned by the column metadata query) for both the SELECT projection and the INSERT.
+
+**Progress fields tracked on the job** (in `job_service.py`): `job_id`, `source_schema`, `source_table`, `target_database`, `target_table`, `status`, `total_rows`, `processed_rows`, `inserted_rows`, `remaining_rows`, `batches_completed`, `current_batch`, `progress_percent`, `rows_per_second`, `elapsed_seconds`, `started_at`, `finished_at`, `duration_seconds`, `error_message`.
 
 **Code that must exist after the phase**:
 - `POST /api/migrations` validates selection, creates a job, kicks off the background full load, returns `job_id` immediately.
 - The pipeline drops the existing target table, recreates it empty, then loads the **entire** Oracle source. Re-launching the same source schema/table drops+recreates and reloads in full, so the target ends with **only the latest full-load result** (e.g. 100 source rows → 100 target rows on every run, never 200). The engine never appends a second full copy and performs no row-skipping/merge.
-- Migration reads via `cursor.fetchmany(MIGRATION_BATCH_SIZE)` and batch-inserts into ClickHouse — never `read_sql` of the whole table.
-- Job statuses PENDING→RUNNING→SUCCESS/FAILED/CANCELLED; metadata tracks job_id, source_schema, source_table, target_database, target_table, status, total_rows, processed_rows, started_at, finished_at, duration_seconds, error_message.
-- `GET /api/migrations/{job_id}` and `/status` reflect live progress.
+- Migration reads via `cursor.fetchmany(MIGRATION_BATCH_SIZE)` (with `arraysize`/`prefetchrows` set) and batch-inserts into ClickHouse with explicit, stable column ordering — never `read_sql`/`fetchall` of the whole table, never row-by-row insert.
+- Job statuses PENDING→RUNNING→SUCCESS/FAILED/CANCELLED; the job tracks every progress field listed above and updates them as batches complete.
+- `GET /api/migrations/{job_id}` returns the full job record; `GET /api/migrations/{job_id}/status` returns the live overall-progress view: `status`, `total_rows`, `processed_rows`, `inserted_rows`, `remaining_rows`, `progress_percent`, `batches_completed`, `current_batch`, `rows_per_second`, `elapsed_seconds`, `error_message` (a `workers` array is added in Phase 7; validation fields in Phase 8). See `contracts/migrations.md`.
 
-**Acceptance criteria**: launch from GUI; job id returned immediately; target table is dropped and recreated before load; full data loads in batches; browser doesn't block; job status updates; **re-running the same table yields the same row count, not a doubled count**; Oracle read-only; CH writes only to `oracle_migration_hazem`.
+**Live migration progress UI (single-thread)**: the GUI must show, after launch and while polling `/status`: an **overall progress bar (0–100%)**, **job status** (PENDING/RUNNING/SUCCESS/FAILED/CANCELLED), **total rows**, **processed rows**, **inserted rows**, **remaining rows**, **elapsed time**, **rows per second**, **current batch number**, and an **error message** when the job fails.
 
-**Constitution gate (P-V, P-I, P-II, P-VII)**: extraction uses `cursor.fetchmany(MIGRATION_BATCH_SIZE)` (no full-table read, no `pandas.read_sql` of the whole table); Oracle issues only `SELECT`; only `DROP TABLE IF EXISTS`/`CREATE TABLE`/`INSERT` run, and only against `oracle_migration_hazem`; source schema/table re-validated against metadata before launch; no secrets in job records or logs.
+**Acceptance criteria**: launch from GUI; job id returned immediately; target table is dropped and recreated before load; full data loads in batches (no `read_sql`/`fetchall`/row-by-row); the live progress UI shows overall progress bar, status, total/processed/inserted/remaining rows, elapsed time, rows/sec, current batch, and error-on-failure; browser doesn't block; job status updates; **re-running the same table yields the same row count, not a doubled count**; Oracle read-only; CH writes only to `oracle_migration_hazem`.
+
+**Constitution gate (P-V, P-I, P-II, P-VII)**: extraction uses `cursor.fetchmany(MIGRATION_BATCH_SIZE)` with tuned `arraysize`/`prefetchrows` (no full-table read, no `pandas.read_sql`, no `fetchall`, no row-by-row insert); Oracle issues only `SELECT`; only `DROP TABLE IF EXISTS`/`CREATE TABLE`/`INSERT` run, and only against `oracle_migration_hazem`; source schema/table re-validated against metadata before launch; `migration_service.py`/`job_service.py` import no FastAPI; no secrets in job records or logs.
 
 **Manual test commands**:
 ```bash
@@ -407,20 +442,26 @@ curl http://localhost:8000/api/migrations/$JOB/status
 **Scope**: Parallel migration after single-thread is stable. Modes: numeric range, date range, hash fallback. Still full-load replace only — no CDC/incremental/dedup/merge/append.
 
 **Files to create or update**:
-- `app/services/migration_service.py` — keep the drop+create as a **single step performed once** before any worker starts; then add a worker pool that loads partitions of the **full** source: numeric-range splitting (`MIN/MAX`, half-open ranges, final range inclusive), date-range splitting, hash mode (`MOD(ORA_HASH(col), :workers) = :id`); aggregate progress; mark job FAILED if any worker fails. Ranges partition the whole table exactly once (union = full table, no overlap), so parallelism speeds up the same full load without duplicating or skipping rows.
+- `app/services/migration_service.py` — keep the drop+create as a **single step performed once** before any worker starts; then add a worker pool that loads partitions of the **full** source: numeric-range splitting (`MIN/MAX`, half-open ranges, final range inclusive), date-range splitting, hash mode (`MOD(ORA_HASH(col), :workers) = :id`); aggregate per-worker progress into the overall job progress; mark job FAILED if any worker fails. Each worker observes the same performance rules as Phase 6 (`arraysize`/`prefetchrows`, `fetchmany`, batch insert, explicit/stable column order). Ranges partition the whole table exactly once (union = full table, no overlap), so parallelism speeds up the same full load without duplicating or skipping rows.
+- `app/services/job_service.py` — add a per-worker progress registry on the job (see fields below); aggregate workers' `processed_rows`/`inserted_rows` into the job totals and recompute `progress_percent`/`rows_per_second`.
 - `app/config.py` — `MIGRATION_DEFAULT_WORKERS=8`, enforce max 16.
-- `app/api/migration_routes.py` — thin wrapper: accept and validate `workers` and partition mode/column.
+- `app/api/migration_routes.py` — thin wrapper: accept and validate `workers` and partition mode/column; `/status` now also returns the `workers` array.
+- `app/static/app.js` + `app/templates/index.html` — render a **per-worker progress table/cards** alongside the overall progress bar.
 - `tests/test_range_split.py` — unit tests proving no overlap/no gaps for numeric and date splits.
+
+**Per-worker progress fields** (tracked per worker, returned in `/status`): `worker_id`, `partition_mode`, `partition_column`, `range_start`, `range_end`, `status`, `processed_rows`, `inserted_rows`, `batches_completed`, `rows_per_second`, `error_message`.
 
 **Code that must exist after the phase**:
 - Target table is dropped and recreated **exactly once** per job (before workers fan out); workers only `INSERT` into that fresh target — never re-drop or re-create mid-job.
 - Mode selection: numeric range when numeric column chosen; date range when date/timestamp column chosen; hash mode fallback for non-null high-cardinality column.
-- Per-worker bounded SQL using bind variables; each worker batch-inserts and updates progress.
-- Worker count configurable, default 8, capped at 16; any worker failure → job FAILED.
+- Per-worker bounded SQL using bind variables; each worker batch-inserts and updates its own progress (the fields above), which aggregate into the overall job progress.
+- `GET /api/migrations/{job_id}/status` returns both the overall job progress (Phase 6 fields) **and** a `workers` array (one entry per worker with the per-worker fields above). See `contracts/migrations.md`.
+- The GUI shows one row/card per worker (worker_id, mode, column, range, status, processed/inserted rows, batches, rows/sec, error) in addition to the overall progress bar.
+- Worker count configurable, default 8, capped at 16; any worker failure → job FAILED (and that worker's `error_message` is surfaced).
 
-**Acceptance criteria**: numeric parallel works; date parallel works when date column exists; hash mode works as fallback; worker failures handled; total processed rows tracked; no duplicate/missing ranges for numeric/date; re-running the same table still yields latest-only counts (single drop+create per job, not per worker).
+**Acceptance criteria**: numeric parallel works; date parallel works when date column exists; hash mode works as fallback; worker failures handled and surfaced per worker; total processed/inserted rows tracked and aggregated; the GUI renders per-worker progress cards plus the overall bar; `/status` returns the `workers` array; no duplicate/missing ranges for numeric/date; re-running the same table still yields latest-only counts (single drop+create per job, not per worker).
 
-**Constitution gate (P-V, P-I, P-II, P-VII)**: parallel mode is enabled only after single-thread (Phase 6) is proven; each worker still uses chunked `fetchmany` + batch insert (no full-range load into memory); per-worker `SELECT` bounds use bind variables; worker count is clamped to max 16; the only ClickHouse statements are one `DROP`/`CREATE` pair plus `INSERT`s, all in `oracle_migration_hazem`; row-count reconciliation (Phase 8) confirms no duplicate/missing rows.
+**Constitution gate (P-V, P-I, P-II, P-VII)**: parallel mode is enabled only after single-thread (Phase 6) is proven; each worker still uses tuned `arraysize`/`prefetchrows` + chunked `fetchmany` + batch insert (no full-range load into memory, no `fetchall`, no row-by-row); per-worker `SELECT` bounds use bind variables; worker count is clamped to max 16; the only ClickHouse statements are one `DROP`/`CREATE` pair plus `INSERT`s, all in `oracle_migration_hazem`; row-count reconciliation (Phase 8) confirms no duplicate/missing rows.
 
 **Manual test commands**:
 ```bash
@@ -443,13 +484,14 @@ pytest tests/test_range_split.py
 **Files to create or update**:
 - `app/services/migration_service.py` (or `job_service.py`) — after load, run Oracle `COUNT(*)` and ClickHouse `COUNT(*)`, compute match.
 - Job metadata — add `source_row_count`, `target_row_count`, `count_match`, `validation_status`.
-- `app/api/migration_routes.py` — expose validation fields in job responses.
+- `app/api/migration_routes.py` — expose validation fields in the full job record **and in `GET /api/migrations/{job_id}/status`** (so a single poll returns overall progress + per-worker progress + validation). See `contracts/migrations.md`.
 - `app/static/app.js` / `index.html` — show counts and match/mismatch.
 
 **Code that must exist after the phase**:
 - Oracle count: `SELECT COUNT(*) FROM <schema>.<table>` (read-only).
 - ClickHouse count: `SELECT COUNT(*) FROM oracle_migration_hazem.<schema>__<table>`.
 - Because this is a full-load replace into a freshly created table, `count_match` is exact equality (target == source); any inequality is a hard validation failure. Counts + match stored in job and shown in GUI; mismatch clearly flagged.
+- `GET /api/migrations/{job_id}/status` now returns the validation fields (`source_row_count`, `target_row_count`, `count_match`, `validation_status`) in addition to overall progress and the `workers` array.
 
 **Acceptance criteria**: source count captured; target count captured; exact count match shown in GUI; validation failure clearly displayed; re-running the same table reports the same source/target counts (no drift from duplication); validation does not modify Oracle.
 
