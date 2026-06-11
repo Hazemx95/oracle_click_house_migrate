@@ -3,7 +3,9 @@
 .env.*
 *.env
 !.env.example
-
+.agents
+.claude
+.specify
 # Python/local runtime artifacts
 oracle_click-house_venv/
 .venv/
