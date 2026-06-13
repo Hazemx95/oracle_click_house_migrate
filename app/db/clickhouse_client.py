@@ -1,5 +1,5 @@
-from typing import Any
 import re
+from typing import Any
 
 from app.config import TARGET_DATABASE, Settings, get_settings
 
@@ -22,6 +22,7 @@ _CREATE_DDL_RE = re.compile(
     rf"^CREATE\s+TABLE\s+(?!IF\s+NOT\s+EXISTS){_TARGET}\s*\(",
     re.IGNORECASE,
 )
+_SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$#]*$")
 
 
 def _safe_error_message(exc: Exception, settings: Settings) -> str:
@@ -93,6 +94,42 @@ def execute_ddl(ddl: str, client: Any | None = None) -> None:
             client.command(statement)
         else:
             client.query(statement)
+    finally:
+        if close_client and hasattr(client, "close"):
+            client.close()
+
+
+def _assert_safe_identifier(identifier: str, label: str) -> None:
+    if not isinstance(identifier, str) or not _SAFE_IDENTIFIER_RE.fullmatch(identifier):
+        raise ValueError(f"ClickHouse {label} contains unsafe characters")
+
+
+def insert_rows(
+    table: str,
+    rows: list[Any] | tuple[Any, ...],
+    column_names: list[str],
+    target_database: str = TARGET_DATABASE,
+    client: Any | None = None,
+) -> int:
+    if target_database != TARGET_DATABASE:
+        raise ValueError(f"target database must be '{TARGET_DATABASE}'")
+    _assert_safe_identifier(table, "table")
+    for column_name in column_names:
+        _assert_safe_identifier(column_name, "column")
+
+    if not rows:
+        return 0
+
+    close_client = client is None
+    client = client or get_client()
+    try:
+        client.insert(
+            table=table,
+            data=list(rows),
+            column_names=column_names,
+            database=target_database,
+        )
+        return len(rows)
     finally:
         if close_client and hasattr(client, "close"):
             client.close()

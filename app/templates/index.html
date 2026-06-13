@@ -13,7 +13,7 @@
         <h1>Oracle to ClickHouse Migration Engine</h1>
         <p class="summary">
           Select an Oracle source table, review the fixed ClickHouse target, and
-          prepare an initial full load. Migration execution is added in a later phase.
+          launch an initial full load into ClickHouse.
         </p>
 
         <section class="status-grid" aria-label="Database health">
@@ -95,6 +95,54 @@
             <p class="launch-message" id="launch-message" role="status" aria-live="polite"></p>
           </div>
         </form>
+
+        <section class="progress-panel" id="migration-progress" aria-label="Migration progress" hidden>
+          <div class="progress-heading">
+            <div>
+              <h2>Migration Progress</h2>
+              <p id="job-id-text">No active job.</p>
+            </div>
+            <strong id="job-status">PENDING</strong>
+          </div>
+
+          <div class="progress-bar" aria-label="Overall migration progress">
+            <div id="progress-fill" style="width: 0%"></div>
+          </div>
+          <p class="progress-percent" id="progress-percent">0%</p>
+
+          <dl class="metrics-grid">
+            <div>
+              <dt>Total Rows</dt>
+              <dd id="total-rows">0</dd>
+            </div>
+            <div>
+              <dt>Processed Rows</dt>
+              <dd id="processed-rows">0</dd>
+            </div>
+            <div>
+              <dt>Inserted Rows</dt>
+              <dd id="inserted-rows">0</dd>
+            </div>
+            <div>
+              <dt>Remaining Rows</dt>
+              <dd id="remaining-rows">0</dd>
+            </div>
+            <div>
+              <dt>Elapsed Time</dt>
+              <dd id="elapsed-seconds">0s</dd>
+            </div>
+            <div>
+              <dt>Rows / Second</dt>
+              <dd id="rows-per-second">0</dd>
+            </div>
+            <div>
+              <dt>Current Batch</dt>
+              <dd id="current-batch">0</dd>
+            </div>
+          </dl>
+
+          <p class="error-message" id="migration-error" hidden></p>
+        </section>
       </section>
     </main>
     <script src="{{ url_for('static', path='app.js') }}"></script>

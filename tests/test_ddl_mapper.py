@@ -79,7 +79,10 @@ def test_number_scale_greater_than_precision_falls_back_with_warning() -> None:
     ]
 
 
-@pytest.mark.parametrize("unsafe", ["", "bad-name", "has space", "a`b", "1starts", "line\nbreak"])
+@pytest.mark.parametrize(
+    "unsafe",
+    ["", "bad-name", "has space", "a`b", "a\"b", "1starts", "line\nbreak"],
+)
 def test_quote_identifier_rejects_unsafe_identifiers(unsafe: str) -> None:
     with pytest.raises(ValueError):
         ddl_mapper.quote_identifier(unsafe)
@@ -89,8 +92,16 @@ def test_quote_identifier_quotes_safe_identifier() -> None:
     assert ddl_mapper.quote_identifier("CM__COMPONENT") == "`CM__COMPONENT`"
 
 
+def test_quote_identifier_allows_oracle_dollar_and_hash_names() -> None:
+    assert ddl_mapper.quote_identifier("ORA$FLAG#") == "`ORA$FLAG#`"
+
+
 def test_safe_target_name_uses_schema_table_prefix() -> None:
     assert ddl_mapper.safe_target_name("CM", "COMPONENT") == "CM__COMPONENT"
+
+
+def test_safe_target_name_supports_oracle_dollar_and_hash_names() -> None:
+    assert ddl_mapper.safe_target_name("SYS$", "FLAG#") == "SYS$__FLAG#"
 
 
 def test_resolve_target_name_supports_safe_custom_target_parts() -> None:

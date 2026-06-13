@@ -182,6 +182,98 @@ input:focus {
   color: #ffffff;
 }
 
+.progress-panel {
+  display: grid;
+  gap: 16px;
+  margin-top: 24px;
+  padding: 22px;
+  border: 1px solid #cbd5e4;
+  border-radius: 16px;
+  background: #fbfdff;
+}
+
+.progress-panel[hidden] {
+  display: none;
+}
+
+.progress-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.progress-heading h2,
+.progress-heading p {
+  margin: 0;
+}
+
+.progress-heading p {
+  margin-top: 8px;
+  color: #52627a;
+}
+
+#job-status {
+  padding: 7px 11px;
+  border-radius: 999px;
+  background: #e7edf6;
+}
+
+.progress-bar {
+  overflow: hidden;
+  height: 16px;
+  border-radius: 999px;
+  background: #e7edf6;
+}
+
+#progress-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #2f80ed, #1fba72);
+  transition: width 180ms ease;
+}
+
+.progress-percent {
+  margin: -8px 0 0;
+  color: #52627a;
+  font-weight: 800;
+}
+
+.metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  margin: 0;
+}
+
+.metrics-grid div {
+  padding: 14px;
+  border: 1px solid #dce3ef;
+  border-radius: 12px;
+  background: #ffffff;
+}
+
+.metrics-grid dt {
+  color: #52627a;
+  font-size: 0.82rem;
+  font-weight: 800;
+}
+
+.metrics-grid dd {
+  margin: 8px 0 0;
+  color: #172033;
+  font-size: 1.15rem;
+  font-weight: 800;
+}
+
+.error-message {
+  margin: 0;
+  padding: 12px;
+  border-radius: 10px;
+  color: #7a1717;
+  background: #fff1f1;
+}
+
 .load-note,
 .launch-message {
   margin: 0;
@@ -224,7 +316,12 @@ button:disabled {
   }
 
   .status-grid,
-  .form-grid {
+  .form-grid,
+  .metrics-grid {
     grid-template-columns: 1fr;
+  }
+
+  .progress-heading {
+    display: grid;
   }
 }

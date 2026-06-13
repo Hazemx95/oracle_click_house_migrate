@@ -12,7 +12,22 @@ const elements = {
   workerThreads: document.querySelector("#worker-threads"),
   launchButton: document.querySelector("#launch-button"),
   launchMessage: document.querySelector("#launch-message"),
+  progressPanel: document.querySelector("#migration-progress"),
+  jobIdText: document.querySelector("#job-id-text"),
+  jobStatus: document.querySelector("#job-status"),
+  progressFill: document.querySelector("#progress-fill"),
+  progressPercent: document.querySelector("#progress-percent"),
+  totalRows: document.querySelector("#total-rows"),
+  processedRows: document.querySelector("#processed-rows"),
+  insertedRows: document.querySelector("#inserted-rows"),
+  remainingRows: document.querySelector("#remaining-rows"),
+  elapsedSeconds: document.querySelector("#elapsed-seconds"),
+  rowsPerSecond: document.querySelector("#rows-per-second"),
+  currentBatch: document.querySelector("#current-batch"),
+  migrationError: document.querySelector("#migration-error"),
 };
+
+let activePollTimer = null;
 
 function setOptions(select, options, placeholder) {
   select.replaceChildren();
@@ -37,13 +52,19 @@ function safeErrorMessage(error) {
   return "Request failed";
 }
 
-async function fetchJson(url) {
-  const response = await fetch(url, { headers: { Accept: "application/json" } });
+async function fetchJson(url, options = {}) {
+  const response = await fetch(url, {
+    ...options,
+    headers: {
+      Accept: "application/json",
+      ...(options.headers || {}),
+    },
+  });
   const data = await response.json().catch(() => ({}));
 
   if (!response.ok) {
     const detail = data.detail || data.error || data.message;
-    const message = typeof detail === "string" ? detail : "Request failed";
+    const message = typeof detail === "string" ? detail : detail?.error || "Request failed";
     throw new Error(message);
   }
 
@@ -153,6 +174,64 @@ function selectedTargetName() {
   return `${targetSchema}__${targetTable}`;
 }
 
+function formatNumber(value) {
+  return Number(value || 0).toLocaleString();
+}
+
+function setProgress(status) {
+  const percent = Math.max(0, Math.min(100, Number(status.progress_percent || 0)));
+  elements.progressPanel.hidden = false;
+  elements.jobStatus.textContent = status.status || "PENDING";
+  elements.progressFill.style.width = `${percent}%`;
+  elements.progressPercent.textContent = `${percent.toFixed(1)}%`;
+  elements.totalRows.textContent = formatNumber(status.total_rows);
+  elements.processedRows.textContent = formatNumber(status.processed_rows);
+  elements.insertedRows.textContent = formatNumber(status.inserted_rows);
+  elements.remainingRows.textContent = formatNumber(status.remaining_rows);
+  elements.elapsedSeconds.textContent = `${Number(status.elapsed_seconds || 0).toFixed(1)}s`;
+  elements.rowsPerSecond.textContent = formatNumber(status.rows_per_second);
+  elements.currentBatch.textContent = formatNumber(
+    status.current_batch_number || status.current_batch,
+  );
+
+  if (status.error_message) {
+    elements.migrationError.hidden = false;
+    elements.migrationError.textContent = status.error_message;
+  } else {
+    elements.migrationError.hidden = true;
+    elements.migrationError.textContent = "";
+  }
+}
+
+function stopPolling() {
+  if (activePollTimer) {
+    window.clearInterval(activePollTimer);
+    activePollTimer = null;
+  }
+}
+
+async function pollStatus(jobId) {
+  try {
+    const status = await fetchJson(`/api/migrations/${encodeURIComponent(jobId)}/status`);
+    setProgress(status);
+
+    if (["SUCCESS", "FAILED", "CANCELLED"].includes(status.status)) {
+      stopPolling();
+      elements.launchButton.disabled = false;
+    }
+  } catch (error) {
+    stopPolling();
+    elements.launchButton.disabled = false;
+    elements.launchMessage.textContent = safeErrorMessage(error);
+  }
+}
+
+function startPolling(jobId) {
+  stopPolling();
+  pollStatus(jobId);
+  activePollTimer = window.setInterval(() => pollStatus(jobId), 2000);
+}
+
 function updateLaunchState() {
   const canLaunch = Boolean(
     elements.sourceSchema.value &&
@@ -182,7 +261,7 @@ function onTableChange() {
   updateLaunchState();
 }
 
-function onLaunchClick() {
+async function onLaunchClick() {
   const targetName = selectedTargetName();
   if (!targetName) {
     return;
@@ -193,9 +272,41 @@ function onLaunchClick() {
     `Initial full load will drop and recreate ${targetPath}, then load the entire Oracle table. Continue?`,
   );
 
-  elements.launchMessage.textContent = confirmed
-    ? `Ready for Phase 6 wiring: ${targetPath} will be fully reloaded when migration logic is added.`
-    : "Initial full load was not launched.";
+  if (!confirmed) {
+    elements.launchMessage.textContent = "Initial full load was not launched.";
+    return;
+  }
+
+  const payload = {
+    source_schema: elements.sourceSchema.value,
+    source_table: elements.sourceTable.value,
+    target_schema: elements.targetSchema.value.trim() || null,
+    target_database: TARGET_DATABASE,
+    target_table: elements.targetTable.value.trim(),
+    partition_column: elements.partitionColumn.value || null,
+    workers: Number(elements.workerThreads.value || 1),
+  };
+
+  try {
+    elements.launchButton.disabled = true;
+    elements.launchMessage.textContent = `Launching full load for ${targetPath}...`;
+    elements.progressPanel.hidden = false;
+    elements.jobIdText.textContent = "Creating migration job...";
+    elements.migrationError.hidden = true;
+
+    const response = await fetchJson("/api/migrations", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    elements.jobIdText.textContent = `Job ${response.job_id}`;
+    elements.launchMessage.textContent = `Migration job ${response.job_id} started. Polling live status.`;
+    startPolling(response.job_id);
+  } catch (error) {
+    elements.launchButton.disabled = false;
+    elements.launchMessage.textContent = safeErrorMessage(error);
+  }
 }
 
 function bindEvents() {

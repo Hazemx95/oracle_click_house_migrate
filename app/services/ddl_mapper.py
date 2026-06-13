@@ -4,7 +4,7 @@ from typing import Any
 from app.config import TARGET_DATABASE
 
 
-_SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$#]*$")
 _TIMESTAMP_PRECISION_RE = re.compile(r"\(\d+\)")
 
 _STRING_TYPES = {"VARCHAR2", "NVARCHAR2", "CHAR", "NCHAR", "CLOB", "NCLOB"}
