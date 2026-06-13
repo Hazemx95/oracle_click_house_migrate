@@ -104,6 +104,36 @@ def _assert_safe_identifier(identifier: str, label: str) -> None:
         raise ValueError(f"ClickHouse {label} contains unsafe characters")
 
 
+def _quote_identifier(identifier: str, label: str) -> str:
+    _assert_safe_identifier(identifier, label)
+    return f"`{identifier}`"
+
+
+def count_rows(
+    table: str,
+    target_database: str = TARGET_DATABASE,
+    client: Any | None = None,
+) -> int:
+    if target_database != TARGET_DATABASE:
+        raise ValueError(f"target database must be '{TARGET_DATABASE}'")
+    target_path = (
+        f"{_quote_identifier(target_database, 'database')}."
+        f"{_quote_identifier(table, 'table')}"
+    )
+    close_client = client is None
+    client = client or get_client()
+    try:
+        result = client.query(f"SELECT COUNT(*) FROM {target_path}")
+        rows = _rows(result)
+        if not rows:
+            return 0
+        first_row = rows[0]
+        return int(first_row[0] if not isinstance(first_row, dict) else next(iter(first_row.values())))
+    finally:
+        if close_client and hasattr(client, "close"):
+            client.close()
+
+
 def insert_rows(
     table: str,
     rows: list[Any] | tuple[Any, ...],
@@ -123,6 +153,7 @@ def insert_rows(
     close_client = client is None
     client = client or get_client()
     try:
+        # One client.insert call per chunk keeps this path batch-oriented, never row-by-row.
         client.insert(
             table=table,
             data=list(rows),

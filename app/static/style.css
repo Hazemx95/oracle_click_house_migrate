@@ -281,8 +281,24 @@ input:focus {
   background: #fff1f1;
 }
 
-.worker-progress h3 {
+.worker-progress h3,
+.diagnostics-panel h3,
+.warnings-panel h4 {
   margin: 0 0 12px;
+}
+
+.diagnostics-panel,
+.warnings-panel {
+  display: grid;
+  gap: 12px;
+}
+
+.warnings-panel ul {
+  margin: 0;
+  padding: 14px 14px 14px 32px;
+  border: 1px solid #f1d18a;
+  border-radius: 12px;
+  background: #fff8e8;
 }
 
 .worker-table-wrap {

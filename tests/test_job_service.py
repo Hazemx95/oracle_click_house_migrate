@@ -35,6 +35,31 @@ def test_create_job_initializes_phase_6_fields() -> None:
     assert job["requested_workers"] == 8
     assert job["requested_parallel_mode"] == "auto"
     assert job["resolved_parallel_mode"] == "single"
+    assert job["source_row_count"] is None
+    assert job["target_row_count"] is None
+    assert job["count_match"] is None
+    assert job["validation_status"] == "NOT_STARTED"
+    assert job["validation_error_message"] is None
+    assert job["warnings"] == []
+    assert "performance_diagnostics" in job
+    diagnostics = job["performance_diagnostics"]
+    assert diagnostics["batch_size"] == 1000
+    for key in (
+        "ddl_duration_seconds",
+        "oracle_count_duration_seconds",
+        "range_discovery_duration_seconds",
+        "oracle_execute_duration_seconds",
+        "oracle_fetch_duration_seconds",
+        "row_conversion_duration_seconds",
+        "clickhouse_insert_duration_seconds",
+        "validation_duration_seconds",
+        "total_duration_seconds",
+        "batches_completed",
+        "average_rows_per_batch",
+        "average_seconds_per_batch",
+        "per_worker",
+    ):
+        assert key in diagnostics
 
 
 def test_update_job_recomputes_progress_and_status_view() -> None:
@@ -62,6 +87,12 @@ def test_update_job_recomputes_progress_and_status_view() -> None:
     assert status["current_batch"] == 1
     assert status["current_batch_number"] == 1
     assert status["workers"] == []
+    assert status["source_row_count"] is None
+    assert status["target_row_count"] is None
+    assert status["count_match"] is None
+    assert status["validation_status"] == "NOT_STARTED"
+    assert status["validation_error_message"] is None
+    assert "performance_diagnostics" in status
 
 
 def test_worker_updates_aggregate_into_job_status() -> None:
@@ -154,3 +185,49 @@ def test_terminal_status_records_finished_time_and_error() -> None:
     assert job["finished_at"] is not None
     assert job["duration_seconds"] is not None
     assert job["error_message"] == "validation failed"
+    assert job["performance_diagnostics"]["total_duration_seconds"] == job["duration_seconds"]
+
+
+def test_warnings_are_appended_and_surface_in_status() -> None:
+    job_id = job_service.create_job(
+        source_schema="CM",
+        source_table="COMPONENT",
+        target_database=TARGET_DATABASE,
+        target_table="CM__COMPONENT",
+    )
+
+    job_service.add_warning(job_id, "Small table detected; single-thread mode may be faster than parallel mode.")
+    status = job_service.get_status(job_id)
+
+    assert status is not None
+    assert status["warnings"] == [
+        "Small table detected; single-thread mode may be faster than parallel mode."
+    ]
+
+
+def test_worker_diagnostics_surface_in_status() -> None:
+    job_id = job_service.create_job(
+        source_schema="CM",
+        source_table="COMPONENT",
+        target_database=TARGET_DATABASE,
+        target_table="CM__COMPONENT",
+    )
+
+    job_service.set_worker_diagnostics(
+        job_id,
+        0,
+        {
+            "oracle_execute_duration_seconds": 0.1,
+            "oracle_fetch_duration_seconds": 0.2,
+            "row_conversion_duration_seconds": 0.3,
+            "clickhouse_insert_duration_seconds": 0.4,
+            "batches_completed": 1,
+            "average_seconds_per_batch": 1.0,
+        },
+    )
+    status = job_service.get_status(job_id)
+
+    assert status is not None
+    per_worker = status["performance_diagnostics"]["per_worker"]
+    assert per_worker[0]["worker_id"] == 0
+    assert per_worker[0]["oracle_fetch_duration_seconds"] == 0.2

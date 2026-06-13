@@ -124,6 +124,12 @@ APP_HOST=0.0.0.0
 APP_PORT=8000
 MIGRATION_BATCH_SIZE=100000
 MIGRATION_DEFAULT_WORKERS=8
+
+# Phase 8.1 performance tuning (each defaults to MIGRATION_BATCH_SIZE when unset)
+ORACLE_ARRAYSIZE=100000
+ORACLE_PREFETCHROWS=100000
+CLICKHOUSE_INSERT_BATCH_SIZE=100000
+MIGRATION_PARALLEL_MIN_ROWS=100000
 ```
 
 ### 4.2 `.env.example`
@@ -146,6 +152,12 @@ APP_HOST=0.0.0.0
 APP_PORT=8000
 MIGRATION_BATCH_SIZE=100000
 MIGRATION_DEFAULT_WORKERS=8
+
+# Phase 8.1 performance tuning (each defaults to MIGRATION_BATCH_SIZE when unset)
+ORACLE_ARRAYSIZE=100000
+ORACLE_PREFETCHROWS=100000
+CLICKHOUSE_INSERT_BATCH_SIZE=100000
+MIGRATION_PARALLEL_MIN_ROWS=100000
 ```
 
 ### 4.3 `.gitignore`
@@ -1435,7 +1447,11 @@ source_row_count
 target_row_count
 count_match
 validation_status
+validation_error_message
 ```
+
+`validation_status` values: `NOT_STARTED`, `RUNNING`, `SUCCESS`, `FAILED`.
+If counts mismatch after a completed full-load replace, mark the job `FAILED` and store a clear mismatch message. If the post-load count step itself cannot run, keep the completed load as `SUCCESS`, set `validation_status=FAILED`, leave `count_match` unknown, and store `validation_error_message`.
 
 ## Acceptance Criteria
 
@@ -1450,6 +1466,76 @@ Phase 8 is complete only when:
 ## Stop Point
 
 Stop after Phase 8. Do not continue until reconciliation works.
+
+---
+
+# 16.1 Phase 8.1 — Performance Diagnostics and Migration Speed Optimization
+
+## Goal
+
+Identify where migration time is spent and optimize the slow path safely. Observed baseline: ~29,792 source rows took ~1496 s (~19 rows/s) in both single-thread and parallel mode. Diagnose the bottleneck **before** changing the migration algorithm.
+
+## Diagnosis First
+
+With `MIGRATION_BATCH_SIZE=100000` and ~29,792 rows, the whole load is a single batch / single insert — so batch granularity is **not** the cause. Time is per-row / per-cell / per-round-trip. Confirm with instrumentation before optimizing. Leading suspects: (1) heavy LOB columns (`_normalize_cell` calls `.read()` per CLOB/BLOB/NCLOB cell = one Oracle round trip each over remote/VPN); (2) repeated fresh Oracle connections for COUNT, MIN/MAX, validation, and per worker; (3) non-indexed range column forcing full scans.
+
+## Scope
+
+Do only:
+
+* Add per-step timing instrumentation to single-thread and parallel paths.
+* Surface the timing breakdown via the job record, both GET endpoints, and a GUI diagnostics section.
+* Run the code-inspection checks below and emit warnings.
+* Apply the bounded optimization rules below.
+
+## Out of Scope (do NOT implement)
+
+No project rewrite; no change to business behavior; no CDC, incremental loading, watermark logic, staging tables, append/duplicate behavior, dedup/merge/upsert, or skip-existing.
+
+## Keep Business Behavior
+
+Initial full load only. Drop target ClickHouse table once per job. Create target ClickHouse table once per job. Load full Oracle source. Validate Oracle count vs ClickHouse count. Oracle stays read-only. ClickHouse writes only to `oracle_migration_hazem`.
+
+## Diagnostics to Capture
+
+total job duration; DDL drop/create duration; Oracle source COUNT duration; Oracle MIN/MAX range discovery duration; Oracle query execute duration; Oracle fetch duration; Python row conversion duration; ClickHouse insert duration; validation count duration; per-worker timing in parallel mode; batch size used; number of batches; average rows per batch; average seconds per batch.
+
+Add diagnostics to: `app/services/job_service.py`; `app/services/migration_service.py`; `GET /api/migrations/{job_id}`; `GET /api/migrations/{job_id}/status`; GUI diagnostics section.
+
+## Code Inspection Requirements
+
+* ClickHouse insert is a true batch insert, not row-by-row.
+* Oracle extraction uses `cursor.fetchmany(batch_size)`, not `fetchall`.
+* `cursor.arraysize` and `cursor.prefetchrows` are configured.
+* Selected columns are projected explicitly, not `SELECT *`.
+* Detect heavy columns (CLOB, BLOB, NCLOB, LONG, RAW) and surface a warning.
+* Detect whether the selected numeric/date partition column is indexed, using Oracle metadata only. Do not create indexes. Do not modify Oracle.
+
+## Optimization Rules
+
+* `MIGRATION_BATCH_SIZE` default 100000.
+* `ORACLE_ARRAYSIZE` default = `MIGRATION_BATCH_SIZE`.
+* `ORACLE_PREFETCHROWS` default = `MIGRATION_BATCH_SIZE`.
+* `CLICKHOUSE_INSERT_BATCH_SIZE` default = `MIGRATION_BATCH_SIZE`.
+* `MIGRATION_PARALLEL_MIN_ROWS` default 100000.
+* If `total_rows < MIGRATION_PARALLEL_MIN_ROWS` and the user did not force parallel, use `workers = 1` and show a warning.
+* For NUMBER scale-0 numeric range splitting, use integer range boundaries, not decimal boundaries.
+* If a numeric/date range mode uses a non-indexed column, warn that range mode may be slow.
+* Keep hash mode available as an explicit user choice.
+
+## Acceptance Criteria
+
+* Status API shows the timing breakdown.
+* GUI shows the timing breakdown.
+* Logs show which step is slow without printing secrets.
+* Migration still succeeds.
+* Validation still works.
+* Service modules remain framework-agnostic and reusable from Flask.
+* FastAPI routes remain thin wrappers.
+
+## Stop Point
+
+Stop after Phase 8.1 once the timing breakdown localizes the slow step (API + GUI + logs), the bounded optimizations are in place, and migration + validation still pass. Then continue Phase 9.
 
 ---
 

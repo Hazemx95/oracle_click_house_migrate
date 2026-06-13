@@ -88,7 +88,20 @@ pytest tests/test_range_split.py     # no overlap, no gaps
 ### Phase 8 — validation
 ```bash
 curl http://localhost:8000/api/migrations/$JOB
-# expect source_row_count, target_row_count, count_match=true, validation_status="MATCH"
+# expect source_row_count, target_row_count, count_match=true, validation_status="SUCCESS"
+```
+
+### Phase 8.1 — performance diagnostics
+```bash
+# Run a migration, then inspect the timing breakdown localizing the slow step
+curl -s http://localhost:8000/api/migrations/$JOB/status | python -m json.tool   # diagnostics block present
+# expect diagnostics.{total_seconds, ddl_seconds, source_count_seconds, range_discovery_seconds,
+#   query_execute_seconds, fetch_seconds, convert_seconds, insert_seconds, validation_seconds,
+#   batch_size, batch_count, avg_rows_per_batch, avg_seconds_per_batch, warnings[], per_worker[]}
+# GUI: confirm the Diagnostics section renders the breakdown and any warnings
+docker logs oracle-clickhouse-migration-app | grep -Ei "password|passwd|secret" && echo "ERROR: secret in logs" || echo "logs clean"
+# small table: confirm workers downgrades to 1 (with warning) unless parallel_mode is forced
+pytest tests/test_migration_service.py tests/test_job_service.py
 ```
 
 ### Phase 9 — team run (fresh clone)

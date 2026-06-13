@@ -18,6 +18,13 @@ class JobStatus(StrEnum):
     CANCELLED = "CANCELLED"
 
 
+class ValidationStatus(StrEnum):
+    NOT_STARTED = "NOT_STARTED"
+    RUNNING = "RUNNING"
+    SUCCESS = "SUCCESS"
+    FAILED = "FAILED"
+
+
 TERMINAL_STATUSES = {
     JobStatus.SUCCESS.value,
     JobStatus.FAILED.value,
@@ -26,6 +33,32 @@ TERMINAL_STATUSES = {
 
 _JOBS: dict[str, dict[str, object]] = {}
 _LOCK = RLock()
+
+PERFORMANCE_TIMING_KEYS = (
+    "ddl_duration_seconds",
+    "oracle_count_duration_seconds",
+    "range_discovery_duration_seconds",
+    "oracle_execute_duration_seconds",
+    "oracle_fetch_duration_seconds",
+    "row_conversion_duration_seconds",
+    "clickhouse_insert_duration_seconds",
+    "validation_duration_seconds",
+    "total_duration_seconds",
+)
+
+
+def _new_performance_diagnostics(batch_size: int | None = None) -> dict[str, object]:
+    diagnostics: dict[str, object] = {key: 0.0 for key in PERFORMANCE_TIMING_KEYS}
+    diagnostics.update(
+        {
+            "batch_size": batch_size or 0,
+            "batches_completed": 0,
+            "average_rows_per_batch": 0.0,
+            "average_seconds_per_batch": 0.0,
+            "per_worker": [],
+        }
+    )
+    return diagnostics
 
 
 def _utc_now_iso() -> str:
@@ -65,6 +98,28 @@ def _apply_derived_progress(job: dict[str, object]) -> None:
     job["rows_per_second"] = (
         round(processed_rows / elapsed_seconds, 2) if elapsed_seconds > 0 else 0.0
     )
+
+    diagnostics = job.get("performance_diagnostics")
+    if isinstance(diagnostics, dict):
+        batches_completed = int(job.get("batches_completed") or 0)
+        diagnostics["batches_completed"] = batches_completed
+        if not diagnostics.get("batch_size") and job.get("batch_size"):
+            diagnostics["batch_size"] = int(job.get("batch_size") or 0)
+        diagnostics["average_rows_per_batch"] = (
+            round(processed_rows / batches_completed, 2) if batches_completed else 0.0
+        )
+        batch_seconds = sum(
+            float(diagnostics.get(key) or 0.0)
+            for key in (
+                "oracle_execute_duration_seconds",
+                "oracle_fetch_duration_seconds",
+                "row_conversion_duration_seconds",
+                "clickhouse_insert_duration_seconds",
+            )
+        )
+        diagnostics["average_seconds_per_batch"] = (
+            round(batch_seconds / batches_completed, 3) if batches_completed else 0.0
+        )
 
 
 def _public_job(job: dict[str, object]) -> dict[str, object]:
@@ -123,7 +178,14 @@ def create_job(
         "rows_per_second": 0.0,
         "error_message": None,
         "warning_message": warning_message,
+        "warnings": [warning_message] if warning_message else [],
+        "source_row_count": None,
+        "target_row_count": None,
+        "count_match": None,
+        "validation_status": ValidationStatus.NOT_STARTED.value,
+        "validation_error_message": None,
         "workers": [],
+        "performance_diagnostics": _new_performance_diagnostics(batch_size),
     }
     with _LOCK:
         _JOBS[job_id] = job
@@ -159,6 +221,9 @@ def update_job(job_id: str, **fields: object) -> dict[str, object]:
             job["finished_at"] = _utc_now_iso()
             job["_finished_at_ts"] = finished_at_ts
             job["duration_seconds"] = _duration_seconds(job.get("_started_at_ts"), finished_at_ts)
+            diagnostics = job.get("performance_diagnostics")
+            if isinstance(diagnostics, dict):
+                diagnostics["total_duration_seconds"] = job["duration_seconds"]
 
         job.update(fields)
 
@@ -167,6 +232,77 @@ def update_job(job_id: str, **fields: object) -> dict[str, object]:
         if "current_batch" in fields and "current_batch_number" not in fields:
             job["current_batch_number"] = fields["current_batch"]
 
+        _apply_derived_progress(job)
+        return _public_job(job)
+
+
+def add_warning(job_id: str, message: str) -> dict[str, object]:
+    with _LOCK:
+        job = _JOBS.get(job_id)
+        if job is None:
+            raise KeyError(f"job '{job_id}' not found")
+        warnings = job.setdefault("warnings", [])
+        if not isinstance(warnings, list):
+            warnings = []
+            job["warnings"] = warnings
+        if message and message not in warnings:
+            warnings.append(message)
+        if not job.get("warning_message") and warnings:
+            job["warning_message"] = warnings[0]
+        return _public_job(job)
+
+
+def add_diagnostic_timing(job_id: str, field: str, seconds: float) -> dict[str, object]:
+    if field not in PERFORMANCE_TIMING_KEYS:
+        raise ValueError(f"unknown diagnostic timing field '{field}'")
+    with _LOCK:
+        job = _JOBS.get(job_id)
+        if job is None:
+            raise KeyError(f"job '{job_id}' not found")
+        diagnostics = job.get("performance_diagnostics")
+        if not isinstance(diagnostics, dict):
+            diagnostics = _new_performance_diagnostics()
+            job["performance_diagnostics"] = diagnostics
+        diagnostics[field] = round(float(diagnostics.get(field) or 0.0) + seconds, 3)
+        _apply_derived_progress(job)
+        return _public_job(job)
+
+
+def update_performance_diagnostics(job_id: str, **fields: object) -> dict[str, object]:
+    with _LOCK:
+        job = _JOBS.get(job_id)
+        if job is None:
+            raise KeyError(f"job '{job_id}' not found")
+        diagnostics = job.get("performance_diagnostics")
+        if not isinstance(diagnostics, dict):
+            diagnostics = _new_performance_diagnostics()
+            job["performance_diagnostics"] = diagnostics
+        diagnostics.update(fields)
+        _apply_derived_progress(job)
+        return _public_job(job)
+
+
+def set_worker_diagnostics(job_id: str, worker_id: int, timings: dict[str, object]) -> dict[str, object]:
+    with _LOCK:
+        job = _JOBS.get(job_id)
+        if job is None:
+            raise KeyError(f"job '{job_id}' not found")
+        diagnostics = job.get("performance_diagnostics")
+        if not isinstance(diagnostics, dict):
+            diagnostics = _new_performance_diagnostics()
+            job["performance_diagnostics"] = diagnostics
+        per_worker = diagnostics.setdefault("per_worker", [])
+        if not isinstance(per_worker, list):
+            per_worker = []
+            diagnostics["per_worker"] = per_worker
+        public_timings = deepcopy(timings)
+        public_timings["worker_id"] = worker_id
+        for index, existing in enumerate(per_worker):
+            if isinstance(existing, dict) and existing.get("worker_id") == worker_id:
+                per_worker[index] = public_timings
+                break
+        else:
+            per_worker.append(public_timings)
         _apply_derived_progress(job)
         return _public_job(job)
 
@@ -250,7 +386,14 @@ def get_status(job_id: str) -> dict[str, object] | None:
         "rows_per_second",
         "error_message",
         "warning_message",
+        "warnings",
+        "source_row_count",
+        "target_row_count",
+        "count_match",
+        "validation_status",
+        "validation_error_message",
         "workers",
+        "performance_diagnostics",
     ]
     return {key: job.get(key) for key in keys}
 

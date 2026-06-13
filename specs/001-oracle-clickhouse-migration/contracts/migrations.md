@@ -67,12 +67,13 @@ Full job record.
   "source_row_count": null,
   "target_row_count": null,
   "count_match": null,
-  "validation_status": "PENDING"
+  "validation_status": "NOT_STARTED",
+  "validation_error_message": null
 }
 ```
 
 ## GET /api/migrations/{job_id}/status
-Polling view returning **overall progress** + **per-worker progress** (Phase 7) + **validation fields** (Phase 8). The `workers` array is empty/omitted for single-thread (Phase 6) jobs; validation fields are `null`/`PENDING` until Phase 8 validation runs.
+Polling view returning **overall progress** + **per-worker progress** (Phase 7) + **validation fields** (Phase 8). The `workers` array is empty/omitted for single-thread (Phase 6) jobs; validation fields are `null`/`NOT_STARTED` until Phase 8 validation runs.
 
 **Response 200**
 ```json
@@ -110,20 +111,62 @@ Polling view returning **overall progress** + **per-worker progress** (Phase 7) 
   "source_row_count": null,
   "target_row_count": null,
   "count_match": null,
-  "validation_status": "PENDING"
+  "validation_status": "NOT_STARTED",
+  "validation_error_message": null
 }
 ```
 
 **Overall progress fields**: `status`, `total_rows`, `processed_rows`, `inserted_rows`, `remaining_rows`, `progress_percent`, `batches_completed`, `current_batch`, `rows_per_second`, `elapsed_seconds`, `error_message`.
 **Parallel-mode fields** (Phase 7): `requested_parallel_mode` ∈ `auto` | `numeric_range` | `date_range` | `hash`; `resolved_parallel_mode` ∈ `numeric_range` | `date_range` | `hash` (may be `single` for a single-worker run) — never `auto`.
 **Per-worker fields** (Phase 7, + Phase 7 `resolved_parallel_mode`): `worker_id`, `partition_mode`, `resolved_parallel_mode`, `partition_column`, `range_start`, `range_end`, `status`, `processed_rows`, `inserted_rows`, `batches_completed`, `rows_per_second`, `error_message`.
-**Validation fields** (Phase 8): `source_row_count`, `target_row_count`, `count_match`, `validation_status`.
+**Validation fields** (Phase 8): `source_row_count`, `target_row_count`, `count_match`, `validation_status`, `validation_error_message`.
+**Diagnostics field** (Phase 8.1): `diagnostics` — performance timing breakdown, returned by **both** `GET /api/migrations/{job_id}` and `GET /api/migrations/{job_id}/status`. Contains no secrets and no raw row/LOB data.
+
+## Diagnostics (Phase 8.1)
+`diagnostics` is a per-step performance breakdown (seconds, monotonic clock) added to localize the slow path. The single-thread and parallel paths both populate it; the GUI renders it as a Diagnostics section.
+
+```json
+{
+  "diagnostics": {
+    "total_seconds": 1496.0,
+    "ddl_seconds": 0.4,
+    "source_count_seconds": 2.1,
+    "range_discovery_seconds": 0.0,
+    "query_execute_seconds": 1.2,
+    "fetch_seconds": 740.0,
+    "convert_seconds": 730.0,
+    "insert_seconds": 18.0,
+    "validation_seconds": 2.3,
+    "batch_size": 100000,
+    "batch_count": 1,
+    "avg_rows_per_batch": 29792,
+    "avg_seconds_per_batch": 1488.0,
+    "warnings": [
+      "Heavy LOB columns detected (CLOB/BLOB) — per-LOB reads likely dominate fetch time",
+      "Table below MIGRATION_PARALLEL_MIN_ROWS — running single-thread (workers=1)"
+    ],
+    "per_worker": [
+      {
+        "worker_id": 0,
+        "query_execute_seconds": 0.3,
+        "fetch_seconds": 92.0,
+        "convert_seconds": 91.0,
+        "insert_seconds": 2.2,
+        "batch_count": 1,
+        "avg_seconds_per_batch": 185.0
+      }
+    ]
+  }
+}
+```
+
+Fields: `total_seconds`, `ddl_seconds`, `source_count_seconds`, `range_discovery_seconds` (0 for single/hash), `query_execute_seconds`, `fetch_seconds`, `convert_seconds` (includes LOB `.read()` cost), `insert_seconds`, `validation_seconds`, `batch_size`, `batch_count`, `avg_rows_per_batch`, `avg_seconds_per_batch`, `warnings` (heavy columns, non-indexed range column, small-table single-worker downgrade), and `per_worker` (parallel mode) with each worker's `query_execute_seconds`/`fetch_seconds`/`convert_seconds`/`insert_seconds`/`batch_count`/`avg_seconds_per_batch`. The example values above illustrate the suspected LOB-fetch bottleneck behind the ~19 rows/s baseline.
 
 ## Job statuses
 `PENDING` → `RUNNING` → `SUCCESS` | `FAILED` | `CANCELLED`. Any worker failure → `FAILED`.
 
 ## Validation fields (Phase 8)
-After load: `source_row_count` (`SELECT COUNT(*) FROM <schema>.<table>`), `target_row_count` (`SELECT COUNT(*) FROM oracle_migration_hazem.<schema>__<table>`), `count_match` (bool), `validation_status` ∈ `PENDING` | `MATCH` | `MISMATCH`.
+After load: `source_row_count` (`SELECT COUNT(*) FROM <schema>.<table>`), `target_row_count` (`SELECT COUNT(*) FROM oracle_migration_hazem.<schema>__<table>`), `count_match` (bool or null when validation could not compare counts), `validation_status` ∈ `NOT_STARTED` | `RUNNING` | `SUCCESS` | `FAILED`, and `validation_error_message` (null unless validation fails). A count mismatch marks the job `FAILED`; a count-query infrastructure failure after the load completes leaves the job `SUCCESS` while setting `validation_status="FAILED"` and `count_match=null`.
 
 ## POST /api/migrations/{job_id}/cancel  (Phase 10)
 Requests cancellation; transitions a `RUNNING` job toward `CANCELLED`.

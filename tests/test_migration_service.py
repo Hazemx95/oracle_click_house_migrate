@@ -1,4 +1,4 @@
-from app.config import TARGET_DATABASE
+from app.config import TARGET_DATABASE, Settings
 from app.db import clickhouse_client
 from app.services import job_service, migration_service
 
@@ -139,6 +139,142 @@ def test_clickhouse_insert_rows_uses_batch_insert_with_explicit_columns() -> Non
     ]
 
 
+def test_get_oracle_row_count_validates_metadata_and_runs_count_only(monkeypatch) -> None:
+    captured = {}
+    monkeypatch.setattr(migration_service.metadata_service, "schema_exists", lambda schema: True)
+    monkeypatch.setattr(
+        migration_service.metadata_service,
+        "table_exists",
+        lambda schema, table: True,
+    )
+
+    def fake_run_select(sql, binds=None):  # type: ignore[no-untyped-def]
+        captured["sql"] = sql
+        captured["binds"] = binds
+        return [(123,)]
+
+    monkeypatch.setattr(migration_service.oracle_client, "run_select", fake_run_select)
+
+    count = migration_service.get_oracle_row_count("CM", "COMPONENT")
+
+    assert count == 123
+    assert captured["sql"] == 'SELECT COUNT(*) FROM "CM"."COMPONENT"'
+    assert captured["binds"] is None
+
+
+def test_get_clickhouse_row_count_confines_query_to_target_database(monkeypatch) -> None:
+    captured = {}
+
+    def fake_count_rows(table, target_database):  # type: ignore[no-untyped-def]
+        captured["table"] = table
+        captured["target_database"] = target_database
+        return 456
+
+    monkeypatch.setattr(migration_service.clickhouse_client, "count_rows", fake_count_rows)
+
+    count = migration_service.get_clickhouse_row_count(TARGET_DATABASE, "CM__COMPONENT")
+
+    assert count == 456
+    assert captured == {
+        "table": "CM__COMPONENT",
+        "target_database": TARGET_DATABASE,
+    }
+
+
+def test_get_clickhouse_row_count_rejects_non_target_database() -> None:
+    try:
+        migration_service.get_clickhouse_row_count("default", "CM__COMPONENT")
+    except ValueError as exc:
+        assert str(exc) == "target database must be 'oracle_migration_hazem'"
+    else:  # pragma: no cover - defensive assertion
+        raise AssertionError("non-target database was not rejected")
+
+
+def test_run_validation_marks_success_when_counts_match(monkeypatch) -> None:
+    job_id = job_service.create_job(
+        source_schema="CM",
+        source_table="COMPONENT",
+        target_database=TARGET_DATABASE,
+        target_table="CM__COMPONENT",
+    )
+    job_service.update_job(job_id, status=job_service.JobStatus.RUNNING)
+    monkeypatch.setattr(migration_service, "count_source", lambda schema, table: 10)
+    monkeypatch.setattr(
+        migration_service,
+        "count_target",
+        lambda target_table, target_database: 10,
+    )
+
+    migration_service.run_validation(job_id)
+    job = job_service.get_job(job_id)
+
+    assert job is not None
+    assert job["status"] == "SUCCESS"
+    assert job["error_message"] is None
+    assert job["source_row_count"] == 10
+    assert job["target_row_count"] == 10
+    assert job["count_match"] is True
+    assert job["validation_status"] == "SUCCESS"
+    assert job["validation_error_message"] is None
+
+
+def test_run_validation_marks_failed_when_counts_mismatch(monkeypatch) -> None:
+    job_id = job_service.create_job(
+        source_schema="CM",
+        source_table="COMPONENT",
+        target_database=TARGET_DATABASE,
+        target_table="CM__COMPONENT",
+    )
+    job_service.update_job(job_id, status=job_service.JobStatus.RUNNING)
+    monkeypatch.setattr(migration_service, "count_source", lambda schema, table: 10)
+    monkeypatch.setattr(
+        migration_service,
+        "count_target",
+        lambda target_table, target_database: 9,
+    )
+
+    migration_service.run_validation(job_id)
+    job = job_service.get_job(job_id)
+
+    assert job is not None
+    assert job["status"] == "FAILED"
+    assert job["source_row_count"] == 10
+    assert job["target_row_count"] == 9
+    assert job["count_match"] is False
+    assert job["validation_status"] == "FAILED"
+    assert job["validation_error_message"] == (
+        "Row count mismatch: Oracle source has 10 rows, ClickHouse target has 9 rows."
+    )
+
+
+def test_run_validation_keeps_source_count_when_target_count_fails(monkeypatch) -> None:
+    job_id = job_service.create_job(
+        source_schema="CM",
+        source_table="COMPONENT",
+        target_database=TARGET_DATABASE,
+        target_table="CM__COMPONENT",
+    )
+    job_service.update_job(job_id, status=job_service.JobStatus.RUNNING)
+    monkeypatch.setattr(migration_service, "count_source", lambda schema, table: 10)
+
+    def raise_target_error(target_table, target_database):  # type: ignore[no-untyped-def]
+        raise RuntimeError("target count unavailable")
+
+    monkeypatch.setattr(migration_service, "count_target", raise_target_error)
+
+    migration_service.run_validation(job_id)
+    job = job_service.get_job(job_id)
+
+    assert job is not None
+    assert job["status"] == "SUCCESS"
+    assert job["error_message"] is None
+    assert job["source_row_count"] == 10
+    assert job["target_row_count"] is None
+    assert job["count_match"] is None
+    assert job["validation_status"] == "FAILED"
+    assert job["validation_error_message"] == "validation: target count unavailable"
+
+
 def test_hash_worker_uses_null_safe_hash_predicate(monkeypatch) -> None:
     captured = {}
     job_id = job_service.create_job(
@@ -257,3 +393,91 @@ def test_run_parallel_aggregates_worker_progress(monkeypatch) -> None:
     assert status["inserted_rows"] == 100
     assert status["batches_completed"] == 2
     assert status["progress_percent"] == 100.0
+
+
+def test_small_table_auto_mode_downgrades_to_single_with_warning(monkeypatch) -> None:
+    monkeypatch.setattr(
+        migration_service,
+        "get_settings",
+        lambda: Settings(migration_parallel_min_rows=100000),
+    )
+    request = migration_service.InitialLoadRequest(
+        source_schema="CM",
+        source_table="COMPONENT",
+        target_schema="CM",
+        target_table="COMPONENT",
+        partition_column="ID",
+        workers=8,
+        batch_size=1000,
+        requested_parallel_mode="auto",
+        resolved_parallel_mode="numeric_range",
+        partition_mode="numeric",
+    )
+
+    resolved, warning = migration_service.apply_small_table_rule(request, 29792)
+
+    assert resolved.workers == 1
+    assert resolved.resolved_parallel_mode == "single"
+    assert resolved.partition_mode == "single"
+    assert warning == migration_service.SMALL_TABLE_WARNING
+
+
+def test_small_table_explicit_parallel_mode_is_preserved_with_warning(monkeypatch) -> None:
+    monkeypatch.setattr(
+        migration_service,
+        "get_settings",
+        lambda: Settings(migration_parallel_min_rows=100000),
+    )
+    request = migration_service.InitialLoadRequest(
+        source_schema="CM",
+        source_table="COMPONENT",
+        target_schema="CM",
+        target_table="COMPONENT",
+        partition_column="ID",
+        workers=8,
+        batch_size=1000,
+        requested_parallel_mode="numeric_range",
+        resolved_parallel_mode="numeric_range",
+        partition_mode="numeric",
+    )
+
+    resolved, warning = migration_service.apply_small_table_rule(request, 29792)
+
+    assert resolved.workers == 8
+    assert resolved.resolved_parallel_mode == "numeric_range"
+    assert resolved.partition_mode == "numeric"
+    assert warning == migration_service.SMALL_TABLE_WARNING
+
+
+def test_integer_numeric_ranges_use_integer_boundaries_without_gaps() -> None:
+    ranges = migration_service.compute_numeric_ranges(
+        41765960,
+        41766031,
+        8,
+        integer_boundaries=True,
+    )
+
+    assert len(ranges) == 8
+    assert all(isinstance(item.start, int) and isinstance(item.end, int) for item in ranges)
+    assert all("." not in str(item.start) and "." not in str(item.end) for item in ranges)
+    assert ranges[0].start == 41765960
+    assert ranges[-1].end == 41766031
+    assert ranges[-1].inclusive_end is True
+    for left, right in zip(ranges, ranges[1:]):
+        assert left.end == right.start
+        assert left.inclusive_end is False
+
+
+def test_error_message_includes_step_and_redacts_secret(monkeypatch) -> None:
+    monkeypatch.setattr(
+        migration_service,
+        "get_settings",
+        lambda: Settings(p5_qa_oracle_password="super-secret"),
+    )
+
+    message = migration_service._safe_error_message(  # noqa: SLF001
+        RuntimeError("failed with super-secret"),
+        "oracle_fetch",
+    )
+
+    assert message == "oracle_fetch: failed with ***"

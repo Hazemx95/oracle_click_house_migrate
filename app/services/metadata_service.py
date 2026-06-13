@@ -62,6 +62,32 @@ WHERE owner = :schema_name
 ORDER BY column_id
 """
 
+HEAVY_COLUMNS_SQL = """
+SELECT
+    column_name,
+    data_type,
+    data_length,
+    char_length
+FROM all_tab_columns
+WHERE owner = :schema_name
+  AND table_name = :table_name
+  AND (
+        data_type IN ('CLOB', 'BLOB', 'NCLOB', 'LONG', 'RAW')
+        OR (data_type IN ('VARCHAR2', 'NVARCHAR2') AND NVL(char_length, data_length) > :large_text_threshold)
+      )
+ORDER BY column_id
+"""
+
+INDEXED_COLUMN_SQL = """
+SELECT COUNT(*)
+FROM all_ind_columns
+WHERE table_owner = :schema_name
+  AND table_name = :table_name
+  AND column_name = :column_name
+"""
+
+LARGE_TEXT_THRESHOLD = 4000
+
 
 def _clean_identifier(value: str) -> str:
     return value.strip()
@@ -171,3 +197,42 @@ def list_partition_candidates(schema: str, table: str) -> list[dict[str, Any]]:
             }
         )
     return candidates
+
+
+def detect_heavy_columns(schema: str, table: str) -> list[dict[str, Any]]:
+    schema_name = _clean_identifier(schema)
+    table_name = _clean_identifier(table)
+    rows = oracle_client.run_select(
+        HEAVY_COLUMNS_SQL,
+        {
+            "schema_name": schema_name,
+            "table_name": table_name,
+            "large_text_threshold": LARGE_TEXT_THRESHOLD,
+        },
+    )
+    return [
+        {
+            "column_name": _column(row, 0, "column_name"),
+            "data_type": _column(row, 1, "data_type"),
+            "data_length": _column(row, 2, "data_length"),
+            "char_length": _column(row, 3, "char_length"),
+        }
+        for row in rows
+    ]
+
+
+def is_column_indexed(schema: str, table: str, column: str) -> bool:
+    schema_name = _clean_identifier(schema)
+    table_name = _clean_identifier(table)
+    column_name = _clean_identifier(column)
+    if not schema_name or not table_name or not column_name:
+        return False
+    rows = oracle_client.run_select(
+        INDEXED_COLUMN_SQL,
+        {
+            "schema_name": schema_name,
+            "table_name": table_name,
+            "column_name": column_name,
+        },
+    )
+    return _count_value(rows) > 0

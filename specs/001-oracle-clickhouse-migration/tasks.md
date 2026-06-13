@@ -183,13 +183,71 @@ description: "Phase-based task list for Oracle to ClickHouse Parallel Data Migra
 
 **Goal**: Capture + compare source/target counts; surface match/mismatch in the job, the `/status` response, and the GUI; Oracle untouched.
 
-- [ ] T067 Add `count_source(schema, table)` to `app/services/migration_service.py` running read-only `SELECT COUNT(*) FROM <schema>.<table>`.
-- [ ] T068 Add `count_target(target_table)` to `app/services/migration_service.py` running `SELECT COUNT(*) FROM oracle_migration_hazem.<target_table>`.
-- [ ] T069 Extend job fields in `app/services/job_service.py` with `source_row_count`, `target_row_count`, `count_match`, `validation_status` (PENDING/MATCH/MISMATCH); compute after load completes. Because this is a full-load replace into a freshly created table, `count_match` is **exact equality** (target == source); any inequality is a hard MISMATCH.
-- [ ] T070 Update `app/api/migration_routes.py` (thin) to include the validation fields in **both** the full job record and `GET /api/migrations/{job_id}/status` (so a single poll returns overall progress + per-worker progress + validation).
-- [ ] T071 Update `app/static/app.js` and `app/templates/index.html` to display source/target counts and a clear match/mismatch indicator.
+- [X] T067 Add `count_source(schema, table)` to `app/services/migration_service.py` running read-only `SELECT COUNT(*) FROM <schema>.<table>`.
+- [X] T068 Add `count_target(target_table)` to `app/services/migration_service.py` running `SELECT COUNT(*) FROM oracle_migration_hazem.<target_table>`.
+- [X] T069 Extend job fields in `app/services/job_service.py` with `source_row_count`, `target_row_count`, `count_match`, `validation_status` (`NOT_STARTED`/`RUNNING`/`SUCCESS`/`FAILED`), and `validation_error_message`; compute after load completes. Because this is a full-load replace into a freshly created table, `count_match` is **exact equality** (target == source); any inequality is a hard validation failure.
+- [X] T070 Update `app/api/migration_routes.py` (thin) to include the validation fields in **both** the full job record and `GET /api/migrations/{job_id}/status` (so a single poll returns overall progress + per-worker progress + validation).
+- [X] T071 Update `app/static/app.js` and `app/templates/index.html` to display source/target counts and a clear match/mismatch indicator.
 
 **Acceptance criteria**: counts captured; exact match shown in GUI; mismatch clearly flagged; `/status` returns the validation fields; re-running the same table reports the same source/target counts (no drift from duplication); Oracle unmodified. **Manual test**: `curl /api/migrations/{job_id}/status` shows the four validation fields with `count_match=true` on a good run; a second run reports identical counts. **Stop point**: reconciliation works before Phase 9.
+
+---
+
+## Phase 8.1: Performance Diagnostics and Migration Speed Optimization
+
+**Goal**: Localize where migration time is actually spent (baseline ~29,792 rows / ~1496 s ≈ 19 rows/s in both single-thread and parallel mode) and apply bounded, behavior-preserving tuning. **Brownfield/additive** — these tasks only **add** diagnostics + safe tuning to the already-completed Phases 6–8 engine; they MUST NOT change business behavior (initial full load only; one drop + one create per job; full Oracle load; Oracle read-only; ClickHouse writes only to `oracle_migration_hazem`). The job diagnostics field is named `performance_diagnostics` (this refines the `diagnostics` block described in `plan.md`/`data-model.md`).
+
+> **Diagnosis-first**: with `MIGRATION_BATCH_SIZE=100000` vs ~29,792 rows the load is a single batch/insert, so batch granularity is not the cause — the cost is per-cell/per-round-trip. Prime suspect is per-LOB locator reads in `migration_service._normalize_cell` (`.read()` per CLOB/BLOB/NCLOB cell) over a remote/VPN link; secondary is repeated fresh Oracle connections (COUNT, MIN/MAX, validation, per worker). Instrument first, then tune.
+
+### Configuration (`app/config.py`)
+
+- [X] T094 Add Phase 8.1 settings to `app/config.py` `Settings` + `get_settings()`: keep existing `migration_batch_size` (default 100000); add `oracle_arraysize`, `oracle_prefetchrows`, `clickhouse_insert_batch_size` (each reading its env var `ORACLE_ARRAYSIZE` / `ORACLE_PREFETCHROWS` / `CLICKHOUSE_INSERT_BATCH_SIZE` and **defaulting to `migration_batch_size`** when unset), and `migration_parallel_min_rows` (env `MIGRATION_PARALLEL_MIN_ROWS`, default 100000).
+- [X] T095 Add positive-integer validation in `app/config.py` for `migration_batch_size`, `oracle_arraysize`, `oracle_prefetchrows`, `clickhouse_insert_batch_size`, and `migration_parallel_min_rows`: reject non-positive/non-integer values with a clear error (no secrets), so misconfiguration fails fast at settings load.
+
+### Job diagnostics state (`app/services/job_service.py`)
+
+- [X] T096 Add a `performance_diagnostics` dict to each job in `app/services/job_service.py` `create_job()` with timing fields initialized to 0.0: `ddl_duration_seconds`, `oracle_count_duration_seconds`, `range_discovery_duration_seconds`, `oracle_execute_duration_seconds`, `oracle_fetch_duration_seconds`, `row_conversion_duration_seconds`, `clickhouse_insert_duration_seconds`, `validation_duration_seconds`, `total_duration_seconds`; plus batch metrics `batch_size`, `batches_completed`, `average_rows_per_batch`, `average_seconds_per_batch`; and a `per_worker` list for parallel timings. Include it in `get_job`/`get_status`/`_public_job` output. No secrets stored.
+- [X] T097 Add a `warnings` list field to each job in `app/services/job_service.py` (`create_job` + output in `get_job`/`get_status`), and a helper `add_warning(job_id, message)` that appends a credential-free message; expose `warnings` in both endpoints' payloads.
+
+### Oracle read-only metadata helpers (`app/services/metadata_service.py`)
+
+- [X] T098 [P] Add a read-only `detect_heavy_columns(schema, table)` helper to `app/services/metadata_service.py` that queries `all_tab_columns` (bind variables, SELECT-only) and returns the columns whose `data_type` is `CLOB`, `BLOB`, `NCLOB`, `LONG`, or `RAW`, plus very large `VARCHAR2`/`NVARCHAR2` (e.g. `char_length`/`data_length` above a threshold). Oracle stays read-only.
+- [X] T099 [P] Add a read-only `is_column_indexed(schema, table, column)` helper to `app/services/metadata_service.py` that checks whether the column appears in `ALL_IND_COLUMNS` (`SELECT ... FROM all_ind_columns WHERE table_owner=:s AND table_name=:t AND column_name=:c`, bind variables, SELECT-only) and returns a boolean. **Never create an index; never modify Oracle.**
+
+### Step instrumentation (`app/services/migration_service.py`)
+
+- [X] T100 Instrument the single-thread/`_copy_batches` path in `app/services/migration_service.py` with `time.perf_counter`: time DDL drop+create (`ddl_duration_seconds`), source `COUNT` (`oracle_count_duration_seconds`), MIN/MAX discovery (`range_discovery_duration_seconds`), **Oracle `cursor.execute` separately from `fetchmany`** (`oracle_execute_duration_seconds` vs `oracle_fetch_duration_seconds`), **Python row conversion/`_normalize_batch` separately** (`row_conversion_duration_seconds`), and **ClickHouse insert separately** (`clickhouse_insert_duration_seconds`); accumulate into the job's `performance_diagnostics` and set `batch_size`, `batches_completed`, `average_rows_per_batch`, `average_seconds_per_batch`. Apply `oracle_arraysize`/`oracle_prefetchrows` to the cursor and `clickhouse_insert_batch_size` to insert chunking (from T094). No FastAPI imports.
+- [X] T101 Add per-worker timing in `run_parallel`/`_run_worker` (`app/services/migration_service.py`): record each worker's execute/fetch/convert/insert seconds and batch counts into the job's `performance_diagnostics.per_worker` list, and **aggregate** worker timings into the overall `performance_diagnostics` totals (sum durations, recompute `batches_completed`/`average_*`). Reuse the same timing helper as T100.
+- [X] T102 Update error handling in `app/services/migration_service.py` (`_safe_error_message` callers / worker + job failure paths) so failures include the **step name** (e.g. `oracle_fetch`, `clickhouse_insert`) while still redacting credentials via the existing secret-scrubbing; record `validation_duration_seconds` around `run_validation` and `total_duration_seconds` for the whole job. Keep the module free of FastAPI imports.
+- [X] T103 In `app/services/migration_service.py`, before/at launch call `detect_heavy_columns` (T098) and, for range modes, `is_column_indexed` (T099); append warnings to the job (T097): a heavy-LOB warning ("Heavy LOB columns detected (…) — per-LOB reads may dominate fetch time") when heavy columns exist, and a non-indexed-range warning ("Range mode on a non-indexed column may be slow") when a numeric/date range mode targets an unindexed column. Warnings only — no behavior change, no Oracle modification.
+
+### Safe tuning (`app/services/migration_service.py`)
+
+- [X] T104 Add the small-table guard to `app/services/migration_service.py` (`_build_request`/`resolve_parallel_mode` path): when `total_rows < migration_parallel_min_rows` **and** the user did not explicitly force a parallel mode (i.e. `parallel_mode == "auto"`), run with `workers = 1` and add the warning "Small table detected; single-thread mode may be faster than parallel mode." An explicit `workers > 1` / explicit parallel mode is **still honored** (warning shown, never blocked).
+- [X] T105 Refine `compute_numeric_ranges` in `app/services/migration_service.py` so that for `NUMBER` scale-0 (integer) partition columns the split boundaries are **integers** (no decimal boundaries for integer ID columns), while preserving the existing half-open ranges with a final inclusive range and full coverage with no gaps/overlap. (Pass column scale through from the resolver/metadata.)
+
+### ClickHouse batch insert verification (`app/db/clickhouse_client.py` / `app/services/migration_service.py`)
+
+- [X] T106 Verify and keep `app/db/clickhouse_client.insert_rows` as a **true batch insert** (single `client.insert(table, data, column_names, database)` per chunk — never row-by-row), preserving explicit column names in stable metadata order; ensure the caller in `_copy_batches` records rows-per-insert-batch and seconds-per-insert-batch into `performance_diagnostics` (feeds T100/T101). Document the confirmation in a brief code comment.
+
+### API (`app/api/migration_routes.py` — thin wrappers)
+
+- [X] T107 Ensure `GET /api/migrations/{job_id}` and `GET /api/migrations/{job_id}/status` in `app/api/migration_routes.py` return `performance_diagnostics` (overall + `per_worker`) and `warnings`. No business logic added in the route file.
+
+### GUI (`app/templates/index.html` + `app/static/app.js`)
+
+- [X] T108 Add a **Performance Diagnostics** section to `app/templates/index.html` and render it in `app/static/app.js` on each status poll: show total duration, Oracle count time, Oracle execute time, Oracle fetch time, row conversion time, ClickHouse insert time, validation time, batch size, average rows per batch, average seconds per batch, and the `warnings` list; in the per-worker table show per-worker timing when `performance_diagnostics.per_worker` is available.
+
+### Tests (`tests/`)
+
+- [X] T109 [P] Add a test to `tests/test_job_service.py` asserting a created job exposes the `performance_diagnostics` field with all timing keys (`ddl_duration_seconds`, `oracle_count_duration_seconds`, `range_discovery_duration_seconds`, `oracle_execute_duration_seconds`, `oracle_fetch_duration_seconds`, `row_conversion_duration_seconds`, `clickhouse_insert_duration_seconds`, `validation_duration_seconds`, `total_duration_seconds`) and batch-metric keys (`batch_size`, `batches_completed`, `average_rows_per_batch`, `average_seconds_per_batch`) present in `get_job`/`get_status` output.
+- [X] T110 [P] Add a test to `tests/test_job_service.py` asserting the job exposes a `warnings` list (default empty) and that `add_warning` appends to it and surfaces in `get_status`.
+- [X] T111 [P] Add a test to `tests/test_migration_service.py` for the small-table rule (T104): `total_rows < migration_parallel_min_rows` with `parallel_mode="auto"` resolves to `workers = 1` with the small-table warning; an explicit `workers > 1` / explicit parallel mode is preserved (warning present, not blocked).
+- [X] T112 [P] Add a test to `tests/test_migration_service.py` for integer numeric range boundaries (T105): a `NUMBER` scale-0 column yields integer (non-decimal) boundaries, half-open ranges with a final inclusive range, and full coverage with no gaps/overlap.
+- [X] T113 [P] Add a test (e.g. `tests/test_service_layer_framework_agnostic.py`) asserting `grep`-style that `app/services/*.py` and `app/db/*.py` contain no `import fastapi` / `from fastapi` (service modules stay framework-agnostic and Flask-importable).
+- [X] T114 [P] Add a test to `tests/test_clickhouse_connection.py` asserting `clickhouse_client.insert_rows` performs a single batch `insert(...)` call for a multi-row batch (e.g. via a fake/mock client capturing one call with all rows) — i.e. it is batch-oriented, not row-by-row.
+
+**Acceptance criteria**: both GET endpoints return `performance_diagnostics` (overall + per-worker) and `warnings`; the GUI shows the timing breakdown + warnings; logs identify the slow step without printing secrets; heavy-LOB and non-indexed-range warnings appear when applicable (no index created, Oracle never modified); small-table auto-downgrade to `workers=1` works (explicit parallel still honored); NUMBER scale-0 ranges use integer boundaries; ClickHouse insert stays a true batch insert; migration + validation still pass and re-runs stay latest-only; `grep -rn "fastapi" app/services/ app/db/` returns nothing. **Manual test**: run a migration, `curl /api/migrations/{job_id}/status | python -m json.tool` shows the diagnostics block + warnings; `docker logs … | grep -Ei "password|secret"` is clean; `pytest tests/test_migration_service.py tests/test_job_service.py tests/test_clickhouse_connection.py`. **Stop point**: timing breakdown localizes the slow step (API + GUI + logs) and bounded optimizations are in place before Phase 9.
 
 ---
 
@@ -229,7 +287,7 @@ description: "Phase-based task list for Oracle to ClickHouse Parallel Data Migra
 
 ### Phase order (sequential — Constitution P-IV)
 
-Phase 0 → 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 10. **Do not start a phase until the prior phase's acceptance criteria pass and its Stop point is satisfied.**
+Phase 0 → 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 8.1 → 9 → 10. **Do not start a phase until the prior phase's acceptance criteria pass and its Stop point is satisfied.**
 
 ### Key cross-phase dependencies
 
@@ -239,6 +297,7 @@ Phase 0 → 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 10. **Do not s
 - Phase 6 (single-thread full load) blocks Phase 7 (parallel only after single-thread is proven — P-V); Phase 7 reuses the one-time recreate step (T057).
 - Within Phase 7, the Parallel Mode selector tasks (T086–T093) are additive on the engine tasks (T057–T066): the resolver maps the resolved mode onto the engine's `partition_mode`, so T057–T066 land before (or alongside) T086–T093.
 - Phase 7 (engine + selector) and Phase 6 precede Phase 8 (validation runs after load).
+- Phase 8.1 (T094–T114) is **additive on Phases 6–8**: config (T094–T095) and job state (T096–T097) come first; metadata helpers (T098–T099) are independent; instrumentation (T100–T102) precedes warning emission (T103) and the GUI (T108); tuning (T104–T105) and the insert check (T106) are independent of instrumentation; API (T107) after job state; tests (T109–T114) follow their targets.
 
 ### Within-phase parallel opportunities
 
@@ -248,6 +307,7 @@ Phase 0 → 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 10. **Do not s
 - **Phase 6**: T047–T052 edit `job_service.py`/`migration_service.py` (sequential); routes (T053), app wiring (T054), and JS/GUI (T055, T056) follow.
 - **Phase 7 (engine)**: T057–T063 edit `migration_service.py`/`job_service.py` (sequential); T064 (route) and T065 (GUI) follow; T066 `[P]` (test file) parallel with engine code.
 - **Phase 7 (selector)**: T086–T088 edit `migration_service.py` (sequential), T089 edits `job_service.py`; T090 (route) follows; T091 (HTML) and T092 (JS) follow; T093 `[P]` (new test file) parallel with the resolver once T086–T088 exist.
+- **Phase 8.1**: T098, T099 `[P]` (independent metadata helpers); T109–T114 `[P]` (distinct test files/cases). T094→T095 (config), T096→T097 (job state), and T100→T101→T102→T103 (instrumentation then warnings) are sequential (same files).
 - **Phase 9**: T076, T077 `[P]` (same README, append-only sections) after T075.
 
 ---

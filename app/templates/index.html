@@ -165,6 +165,80 @@
 
           <p class="error-message" id="migration-error" hidden></p>
 
+          <section class="diagnostics-panel" aria-label="Performance diagnostics">
+            <h3>Performance Diagnostics</h3>
+            <dl class="metrics-grid">
+              <div>
+                <dt>Total Duration</dt>
+                <dd id="diag-total-duration">0s</dd>
+              </div>
+              <div>
+                <dt>Oracle Count Time</dt>
+                <dd id="diag-oracle-count">0s</dd>
+              </div>
+              <div>
+                <dt>Oracle Execute Time</dt>
+                <dd id="diag-oracle-execute">0s</dd>
+              </div>
+              <div>
+                <dt>Oracle Fetch Time</dt>
+                <dd id="diag-oracle-fetch">0s</dd>
+              </div>
+              <div>
+                <dt>Row Conversion Time</dt>
+                <dd id="diag-row-conversion">0s</dd>
+              </div>
+              <div>
+                <dt>ClickHouse Insert Time</dt>
+                <dd id="diag-clickhouse-insert">0s</dd>
+              </div>
+              <div>
+                <dt>Validation Time</dt>
+                <dd id="diag-validation">0s</dd>
+              </div>
+              <div>
+                <dt>Batch Size</dt>
+                <dd id="diag-batch-size">0</dd>
+              </div>
+              <div>
+                <dt>Average Rows / Batch</dt>
+                <dd id="diag-average-rows">0</dd>
+              </div>
+              <div>
+                <dt>Average Seconds / Batch</dt>
+                <dd id="diag-average-seconds">0s</dd>
+              </div>
+            </dl>
+            <div class="warnings-panel">
+              <h4>Warnings</h4>
+              <ul id="diagnostics-warnings"><li>No warnings.</li></ul>
+            </div>
+          </section>
+
+          <section class="validation-panel" aria-label="Validation and reconciliation">
+            <h3>Validation &amp; Reconciliation</h3>
+            <p id="validation-summary">Validation has not started.</p>
+            <dl class="metrics-grid">
+              <div>
+                <dt>Oracle Source Rows</dt>
+                <dd id="source-row-count">-</dd>
+              </div>
+              <div>
+                <dt>ClickHouse Target Rows</dt>
+                <dd id="target-row-count">-</dd>
+              </div>
+              <div>
+                <dt>Count Match</dt>
+                <dd id="count-match">-</dd>
+              </div>
+              <div>
+                <dt>Validation Status</dt>
+                <dd id="validation-status">NOT_STARTED</dd>
+              </div>
+            </dl>
+            <p class="error-message" id="validation-error" hidden></p>
+          </section>
+
           <section class="worker-progress" aria-label="Worker progress">
             <h3>Worker Progress</h3>
             <div class="worker-table-wrap">
@@ -180,11 +254,14 @@
                     <th>Inserted</th>
                     <th>Batches</th>
                     <th>Rows/s</th>
+                    <th>Fetch s</th>
+                    <th>Convert s</th>
+                    <th>Insert s</th>
                     <th>Error</th>
                   </tr>
                 </thead>
                 <tbody id="worker-progress-body">
-                  <tr><td colspan="10">No worker progress yet.</td></tr>
+                  <tr><td colspan="13">No worker progress yet.</td></tr>
                 </tbody>
               </table>
             </div>

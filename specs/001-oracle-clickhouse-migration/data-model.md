@@ -71,7 +71,26 @@ A unit of background migration work.
 - `duration_seconds` (number, nullable)
 - `error_message` (string, nullable)
 - Per-worker progress (Phase 7): `workers` — list of Worker progress entries (see Worker below)
-- Validation fields (Phase 8): `source_row_count`, `target_row_count`, `count_match` (bool), `validation_status` (enum: `PENDING` | `MATCH` | `MISMATCH`)
+- Validation fields (Phase 8): `source_row_count`, `target_row_count`, `count_match` (bool or null), `validation_status` (enum: `NOT_STARTED` | `RUNNING` | `SUCCESS` | `FAILED`), `validation_error_message` (string, nullable)
+- Diagnostics (Phase 8.1): `diagnostics` — performance timing breakdown for the job (see Diagnostics below)
+
+## Diagnostics (embedded in MigrationJob, Phase 8.1)
+Per-step performance instrumentation; all durations in seconds measured with a monotonic clock. Added to localize the slow path before optimizing. Contains no secrets and no raw row/LOB data.
+- `total_seconds` (number) — total job duration (mirrors `duration_seconds`).
+- `ddl_seconds` (number) — DROP + CREATE target table.
+- `source_count_seconds` (number) — Oracle source `COUNT(*)`.
+- `range_discovery_seconds` (number) — Oracle `MIN/MAX` discovery (range modes; 0 for single/hash).
+- `query_execute_seconds` (number) — Oracle `cursor.execute` of the extraction SELECT (summed across batches/workers).
+- `fetch_seconds` (number) — Oracle `fetchmany` time (summed).
+- `convert_seconds` (number) — Python row conversion / normalization time (summed), including any LOB `.read()` cost.
+- `insert_seconds` (number) — ClickHouse batch insert time (summed).
+- `validation_seconds` (number) — post-load count reconciliation time.
+- `batch_size` (int) — effective batch size used.
+- `batch_count` (int) — number of batches across the job.
+- `avg_rows_per_batch` (number) — total processed rows / `batch_count`.
+- `avg_seconds_per_batch` (number) — sum of batch durations / `batch_count`.
+- `warnings` (list of string) — heavy columns present (CLOB/NCLOB/BLOB/LONG/RAW); non-indexed range column; small-table single-worker downgrade; etc.
+- `per_worker` (list, parallel mode) — each entry: `worker_id`, `query_execute_seconds`, `fetch_seconds`, `convert_seconds`, `insert_seconds`, `batch_count`, `avg_seconds_per_batch`.
 
 ### State transitions
 ```
@@ -81,7 +100,7 @@ PENDING ──launch──▶ RUNNING ──all rows loaded & counts match──
    │                   └── cancel requested (Phase 10) ───────▶ CANCELLED
    └── invalid selection at creation ─────────────────────────▶ (rejected, no job)
 ```
-Validation runs after load completes (Phase 8); `validation_status` becomes `MATCH` or `MISMATCH`. A `MISMATCH` is surfaced in the GUI but does not by itself change `status` from SUCCESS unless policy later dictates otherwise.
+Validation runs after load completes (Phase 8); `validation_status` becomes `SUCCESS` when counts match or `FAILED` when counts mismatch or validation cannot run. A count mismatch marks the job `FAILED`; a count-query infrastructure failure after load completion leaves the job `SUCCESS`, sets `count_match` to null, and stores the failure in `validation_error_message`.
 
 ## Worker (transient, Phase 7)
 A parallel extraction+load unit operating on one slice. Each entry is surfaced in `GET /api/migrations/{job_id}/status` under `workers` and rendered as a per-worker card/row in the GUI.
@@ -96,13 +115,15 @@ A parallel extraction+load unit operating on one slice. Each entry is surfaced i
 - `batches_completed` (int)
 - `rows_per_second` (number)
 - `error_message` (string, nullable)
+- `timings` (object, Phase 8.1) — this worker's `query_execute_seconds`, `fetch_seconds`, `convert_seconds`, `insert_seconds`, `batch_count`, `avg_seconds_per_batch`.
 - **Rule**: any worker failure marks the parent job `FAILED` and surfaces that worker's `error_message`.
 
 ## ValidationResult (embedded in MigrationJob, Phase 8)
 - `source_row_count` (int) — `SELECT COUNT(*) FROM <schema>.<table>` (read-only).
 - `target_row_count` (int) — `SELECT COUNT(*) FROM oracle_migration_hazem.<schema>__<table>`.
-- `count_match` (bool) — `source_row_count == target_row_count`.
+- `count_match` (bool, nullable) — `source_row_count == target_row_count`, or null when validation could not compare counts.
 - `validation_status` (enum) — see above.
+- `validation_error_message` (string, nullable) — clear validation failure message without credentials.
 
 ## AuditRecord (persistent, Phase 10 — optional)
 Durable record of each migration for traceability.

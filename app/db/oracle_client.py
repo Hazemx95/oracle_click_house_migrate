@@ -39,7 +39,13 @@ def _assert_select_only(sql: str) -> None:
 
 class ReadOnlyOracleCursor:
     def __init__(self, cursor: Any) -> None:
-        self._cursor = cursor
+        object.__setattr__(self, "_cursor", cursor)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name == "_cursor":
+            object.__setattr__(self, name, value)
+            return
+        setattr(self._cursor, name, value)
 
     def __enter__(self) -> "ReadOnlyOracleCursor":
         if hasattr(self._cursor, "__enter__"):

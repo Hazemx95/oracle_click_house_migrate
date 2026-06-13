@@ -26,7 +26,7 @@ The work is delivered **phase by phase** (Phase 0 through Phase 10). Each phase 
 
 **Project Type**: Web service with server-rendered GUI (single FastAPI app serving JSON APIs + Jinja2 template + static JS/CSS)
 
-**Performance Goals**: Memory bounded by `MIGRATION_BATCH_SIZE` (default 100000 rows) regardless of table size; job id returned within a few seconds of launch; parallel mode (default 8, max 16 workers) measurably faster than single-thread on medium tables
+**Performance Goals**: Memory bounded by `MIGRATION_BATCH_SIZE` (default 100000 rows) regardless of table size; job id returned within a few seconds of launch; parallel mode (default 8, max 16 workers) measurably faster than single-thread on medium tables. Phase 8.1 adds per-step timing diagnostics and bounded tuning (`ORACLE_ARRAYSIZE`, `ORACLE_PREFETCHROWS`, `CLICKHOUSE_INSERT_BATCH_SIZE` each defaulting to `MIGRATION_BATCH_SIZE`; `MIGRATION_PARALLEL_MIN_ROWS` default 100000) to localize and fix the slow path without changing business behavior.
 
 **Constraints**: Oracle is read-only (SELECT only); ClickHouse writes only to `oracle_migration_hazem`; credentials from environment variables only, never hardcoded or logged; bind variables for all parameterized Oracle queries; no full-table reads into memory
 
@@ -526,26 +526,126 @@ pytest tests/test_range_split.py tests/test_parallel_mode.py
 
 **Files to create or update**:
 - `app/services/migration_service.py` (or `job_service.py`) — after load, run Oracle `COUNT(*)` and ClickHouse `COUNT(*)`, compute match.
-- Job metadata — add `source_row_count`, `target_row_count`, `count_match`, `validation_status`.
+- Job metadata — add `source_row_count`, `target_row_count`, `count_match`, `validation_status`, and `validation_error_message`.
 - `app/api/migration_routes.py` — expose validation fields in the full job record **and in `GET /api/migrations/{job_id}/status`** (so a single poll returns overall progress + per-worker progress + validation). See `contracts/migrations.md`.
 - `app/static/app.js` / `index.html` — show counts and match/mismatch.
 
 **Code that must exist after the phase**:
 - Oracle count: `SELECT COUNT(*) FROM <schema>.<table>` (read-only).
 - ClickHouse count: `SELECT COUNT(*) FROM oracle_migration_hazem.<schema>__<table>`.
-- Because this is a full-load replace into a freshly created table, `count_match` is exact equality (target == source); any inequality is a hard validation failure. Counts + match stored in job and shown in GUI; mismatch clearly flagged.
-- `GET /api/migrations/{job_id}/status` now returns the validation fields (`source_row_count`, `target_row_count`, `count_match`, `validation_status`) in addition to overall progress and the `workers` array.
+- Because this is a full-load replace into a freshly created table, `count_match` is exact equality (target == source); any inequality is a hard validation failure and marks the job `FAILED`. If validation cannot run because the count step errors after the load completes, the job remains `SUCCESS`, `validation_status` becomes `FAILED`, `count_match` remains `null`, and `validation_error_message` carries the error.
+- `validation_status` values are `NOT_STARTED`, `RUNNING`, `SUCCESS`, and `FAILED`.
+- `GET /api/migrations/{job_id}/status` now returns the validation fields (`source_row_count`, `target_row_count`, `count_match`, `validation_status`, `validation_error_message`) in addition to overall progress and the `workers` array.
 
-**Acceptance criteria**: source count captured; target count captured; exact count match shown in GUI; validation failure clearly displayed; re-running the same table reports the same source/target counts (no drift from duplication); validation does not modify Oracle.
+**Acceptance criteria**: source count captured; target count captured; exact count match shown in GUI; validation failure clearly displayed; re-running the same table reports the same source/target counts (no drift from duplication); validation does not modify Oracle. Count-based reconciliation can report a mismatch if the Oracle source changes between load-start and post-load validation counts; this is a known limitation of read-only count validation.
 
 **Constitution gate (P-I, P-II)**: validation uses only `SELECT COUNT(*)` — read-only on Oracle and read-only on `oracle_migration_hazem`; no other database is queried for writes; no Oracle modification of any kind.
 
 **Manual test commands**:
 ```bash
-curl http://localhost:8000/api/migrations/$JOB        # includes source_row_count, target_row_count, count_match, validation_status
+curl http://localhost:8000/api/migrations/$JOB        # includes source_row_count, target_row_count, count_match, validation_status, validation_error_message
 ```
 
 **Stop point**: Stop after Phase 8 until reconciliation works.
+
+---
+
+### Phase 8.1 — Performance Diagnostics and Migration Speed Optimization
+
+**Goal**: Find where migration time is actually spent and optimize the slow path **safely**, without changing business behavior. Observed baseline to beat: ~29,792 source rows took ~1496 s (~19 rows/s) in **both** single-thread and parallel mode. This phase adds end-to-end timing instrumentation first (measure before changing), then applies bounded, low-risk tuning.
+
+**Diagnosis-first principle**: Because `MIGRATION_BATCH_SIZE` defaults to 100000 and the observed table is ~29,792 rows, the entire load is a **single batch and a single insert** — so the slowness is **not** batch granularity. The time is per-row / per-cell / per-round-trip. The instrumentation below must localize it before any algorithm change. Leading hypotheses to confirm or rule out with the new timers:
+1. **Heavy LOB columns** (CLOB / NCLOB / BLOB / LONG / RAW). `migration_service._normalize_cell` calls `value.read()` on each LOB locator, which in oracledb thin mode is a **separate Oracle round trip per LOB cell**; over a remote AWS RDS / VPN link this dominates fetch time. `fetch_seconds` + `convert_seconds` will spike if this is the cause.
+2. **Repeated fresh Oracle connections**: `run_select` opens a brand-new connection for the source `COUNT(*)`, for `MIN/MAX` range discovery, and for post-load validation; each parallel worker also opens its own connection. Connection setup latency to a remote DB shows up as `source_count_seconds` / `range_discovery_seconds` / `query_execute_seconds` / `validation_seconds`.
+3. **Non-indexed range/partition column** forcing full scans per worker in range mode (detected from Oracle metadata only — never modified).
+
+**Scope** (do **only** this):
+- Add detailed per-step timing instrumentation to the existing single-thread and parallel paths.
+- Surface the timing breakdown through the job record, the two GET endpoints, and a GUI diagnostics section.
+- Perform the **code-inspection checks** below and emit warnings (no behavior change from the checks themselves).
+- Apply the **bounded optimization rules** below (new env vars + small-table parallel guard + integer numeric boundaries + non-indexed-column warning).
+
+**Explicit non-scope (do NOT implement)**: no project rewrite; no change to business behavior; **no CDC, no incremental loading, no watermark logic, no staging tables, no append/duplicate behavior, no dedup/merge/upsert, no skip-existing**. Business behavior is preserved exactly: initial full load only; drop target ClickHouse table once per job; create target ClickHouse table once per job; load the full Oracle source; validate Oracle count vs ClickHouse count; Oracle stays read-only; ClickHouse writes only to `oracle_migration_hazem`.
+
+**Files to create or update**:
+- `app/config.py` — add the new env-driven settings (see "Optimization rules"): `MIGRATION_BATCH_SIZE` (already present, default 100000), `ORACLE_ARRAYSIZE` (default = `MIGRATION_BATCH_SIZE`), `ORACLE_PREFETCHROWS` (default = `MIGRATION_BATCH_SIZE`), `CLICKHOUSE_INSERT_BATCH_SIZE` (default = `MIGRATION_BATCH_SIZE`), `MIGRATION_PARALLEL_MIN_ROWS` (default 100000). Each resolves to `MIGRATION_BATCH_SIZE` when its own variable is unset.
+- `app/services/migration_service.py` — wrap each timed step (DDL drop/create, source `COUNT`, `MIN/MAX` discovery, Oracle `execute`, Oracle `fetchmany`, Python row conversion/`_normalize_batch`, ClickHouse insert, validation count) with monotonic-clock timers; accumulate per-batch and per-worker timings; record `batch_size`, `batch_count`, `avg_rows_per_batch`, `avg_seconds_per_batch`. Apply `ORACLE_ARRAYSIZE` / `ORACLE_PREFETCHROWS` to the cursor and `CLICKHOUSE_INSERT_BATCH_SIZE` to the insert chunking. Add the small-table parallel guard and integer numeric boundaries (see rules). Keep the module **framework-agnostic (no FastAPI imports)**.
+- `app/services/job_service.py` — store a `diagnostics` block on the job (overall timers + counters) and a `timings` sub-object per worker entry; include them in `get_job` and `get_status` output; never store secrets.
+- `app/api/migration_routes.py` — thin wrappers only: ensure `GET /api/migrations/{job_id}` and `GET /api/migrations/{job_id}/status` return the new `diagnostics` block (and per-worker `timings`). No business logic added here.
+- `app/templates/index.html` + `app/static/app.js` — add a **Diagnostics** section to the live status UI that renders the timing breakdown (overall and per-worker) and any warnings (heavy columns, non-indexed range column, small-table single-worker downgrade).
+- `tests/test_migration_service.py` (and as needed `tests/test_job_service.py`) — unit tests for the new pure helpers: small-table parallel downgrade rule, integer numeric boundary computation, diagnostics aggregation math (`avg_rows_per_batch`, `avg_seconds_per_batch`), and the heavy-column/index-warning detectors. No live DB required.
+
+**Diagnostics captured (job `diagnostics` block)** — all durations in seconds, measured with a monotonic clock:
+- `total_seconds` — total job duration (mirrors `duration_seconds`).
+- `ddl_seconds` — DROP + CREATE target table.
+- `source_count_seconds` — Oracle source `COUNT(*)`.
+- `range_discovery_seconds` — Oracle `MIN/MAX` discovery (range modes; 0 for single/hash).
+- `query_execute_seconds` — Oracle `cursor.execute` of the extraction SELECT (sum across batches/workers).
+- `fetch_seconds` — Oracle `fetchmany` time (sum).
+- `convert_seconds` — Python row conversion / `_normalize_batch` time (sum), incl. any LOB `.read()` cost.
+- `insert_seconds` — ClickHouse batch insert time (sum).
+- `validation_seconds` — post-load count reconciliation time.
+- `batch_size` — effective batch size used.
+- `batch_count` — number of batches across the whole job.
+- `avg_rows_per_batch` — total processed rows / `batch_count`.
+- `avg_seconds_per_batch` — sum of batch durations / `batch_count`.
+- `warnings` — list of strings (heavy columns present; range column not indexed; small-table single-worker downgrade; etc.).
+- `per_worker` (parallel mode) — each worker's `worker_id` plus its own `query_execute_seconds`, `fetch_seconds`, `convert_seconds`, `insert_seconds`, `batch_count`, `avg_seconds_per_batch`.
+
+**Code-inspection requirements** (verify against current code; emit a warning where a risk is found — **do not modify Oracle, do not create indexes**):
+- **ClickHouse insert is a true batch insert, not row-by-row** — confirm `clickhouse_client.insert_rows` calls `client.insert(...)` once per chunk (it does today). Keep it that way.
+- **Oracle extraction uses `cursor.fetchmany(batch_size)`, not `fetchall`** — confirm the copy loop uses `fetchmany` (it does today in `_copy_batches`; `run_select`'s `fetchall` is only for scalar COUNT/MIN-MAX and is acceptable).
+- **`cursor.arraysize` and `cursor.prefetchrows` are configured** — confirm both are set (today both = `batch_size`); drive them from `ORACLE_ARRAYSIZE` / `ORACLE_PREFETCHROWS`.
+- **Explicit column projection, not `SELECT *`** — confirm the SELECT lists columns in stable metadata order (it does today via `_select_source_sql`); keep explicit projection.
+- **Heavy columns** (CLOB, NCLOB, BLOB, LONG, RAW) — detect from `all_tab_columns` metadata and **surface a warning** that per-LOB locator reads are likely the dominant cost; suggest these are read inline/batched. Do not change the type mapping.
+- **Range/partition column index check** — using Oracle metadata **only** (`all_ind_columns` / `all_indexes`, read-only), detect whether the selected numeric/date partition column is indexed; if not, warn that range mode may be slow. **Never create an index; never modify Oracle.**
+
+**Optimization rules** (bounded, behavior-preserving):
+- New env vars with defaults: `MIGRATION_BATCH_SIZE=100000`; `ORACLE_ARRAYSIZE` (default = `MIGRATION_BATCH_SIZE`); `ORACLE_PREFETCHROWS` (default = `MIGRATION_BATCH_SIZE`); `CLICKHOUSE_INSERT_BATCH_SIZE` (default = `MIGRATION_BATCH_SIZE`); `MIGRATION_PARALLEL_MIN_ROWS=100000`. Add them to `.env.example` (placeholders/defaults only).
+- **Small-table guard**: if `total_rows < MIGRATION_PARALLEL_MIN_ROWS` and the user did **not** explicitly force a parallel mode, run with `workers = 1` and add a warning to `diagnostics.warnings` (and surface it in the GUI). An explicit parallel-mode choice is still honored (parallel remains the user's explicit override).
+- **Integer numeric boundaries**: for `NUMBER` scale-0 columns, compute numeric range split boundaries as **integers**, not decimals (refine `compute_numeric_ranges` to emit integer bounds when scale is 0).
+- **Non-indexed range column warning**: if a numeric/date range mode targets a column with no supporting index (per the metadata-only check above), warn that range mode may be slow.
+- **Keep hash mode available as an explicit user choice** (unchanged from Phase 7).
+
+**Code that must exist after the phase**:
+- The single-thread and parallel paths record every timer above and the batch counters; `diagnostics` is populated on the job and returned by both GET endpoints.
+- The GUI shows a Diagnostics section (overall timing breakdown + per-worker timings) and any warnings.
+- Logs print which step is slow **without printing secrets** (reuse `_safe_error_message`-style redaction; never log credentials, full rows, or LOB contents).
+- The new env vars are read in `config.py` (each defaulting to `MIGRATION_BATCH_SIZE`, and `MIGRATION_PARALLEL_MIN_ROWS=100000`) and applied to the cursor/insert/parallel decision.
+- The small-table guard, integer numeric boundaries, heavy-column warning, and non-indexed-range warning are implemented as described.
+- Migration still succeeds and validation still works exactly as in Phases 6–8 (latest-only full-load replace; Oracle read-only; ClickHouse writes only to `oracle_migration_hazem`).
+
+**Acceptance criteria**:
+- `GET /api/migrations/{job_id}/status` (and `GET /api/migrations/{job_id}`) show the timing breakdown (overall + per-worker) and `batch_size` / `batch_count` / `avg_rows_per_batch` / `avg_seconds_per_batch`.
+- The GUI shows the timing breakdown and warnings.
+- Logs show which step is slow without printing secrets.
+- Migration still succeeds; validation still works; re-running the same table stays latest-only.
+- Heavy-column and non-indexed-range warnings appear when applicable; no index is created and Oracle is never modified.
+- The small-table guard downgrades to `workers = 1` (with a warning) when `total_rows < MIGRATION_PARALLEL_MIN_ROWS` and parallel was not explicitly forced.
+- Service modules (`app/services/*`, `app/db/*`) remain framework-agnostic and reusable from Flask; FastAPI routes remain thin wrappers.
+
+**Constitution gate (P-I, P-II, P-V, P-VII)**: instrumentation adds only `SELECT`/timing around existing operations — Oracle stays read-only (no index creation, no DDL/DML on Oracle); ClickHouse writes stay confined to `oracle_migration_hazem` (one DROP/CREATE pair + INSERTs, unchanged); extraction still uses tuned `arraysize`/`prefetchrows` + `fetchmany` + batch insert (no full-table load, no `fetchall` of source data, no row-by-row insert); diagnostics, logs, and job records contain **no secrets** and no raw row/LOB data; the index check reads `all_indexes`/`all_ind_columns` with bind variables only.
+
+**Manual test commands**:
+```bash
+# Launch single-thread and inspect the timing breakdown
+JOB=$(curl -s -X POST http://localhost:8000/api/migrations \
+  -H 'Content-Type: application/json' \
+  -d '{"source_schema":"CM","source_table":"COMPONENT","target_table":"CM__COMPONENT","workers":1,"partition_column":null}' \
+  | python -c "import sys,json;print(json.load(sys.stdin)['job_id'])")
+curl -s http://localhost:8000/api/migrations/$JOB/status | python -m json.tool   # diagnostics block present
+
+# Parallel run shows per-worker timings; small table auto-downgrades to workers=1 unless forced
+curl -s -X POST http://localhost:8000/api/migrations \
+  -H 'Content-Type: application/json' \
+  -d '{"source_schema":"CM","source_table":"COMPONENT","target_table":"CM__COMPONENT","workers":8,"partition_column":"ID","parallel_mode":"auto"}'
+
+# Confirm no secrets leak in logs while step timings are printed
+docker logs oracle-clickhouse-migration-app | grep -Ei "password|passwd|secret" && echo "ERROR: secret in logs" || echo "logs clean"
+pytest tests/test_migration_service.py tests/test_job_service.py
+```
+
+**Stop point**: Stop after Phase 8.1 once the timing breakdown clearly localizes the slow step (in API, GUI, and logs), the bounded optimizations are in place, and migration + validation still pass. Then continue Phase 9 (Final Docker Compose and Team Run).
 
 ---
 

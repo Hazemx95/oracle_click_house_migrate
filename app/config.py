@@ -14,6 +14,18 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_positive_int(name: str, default: int) -> int:
+    raw_value = os.getenv(name)
+    value_text = str(default) if raw_value is None or raw_value == "" else raw_value
+    try:
+        value = int(value_text)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
 class Settings(BaseModel):
     clickhouse_host: str = ""
     clickhouse_port: int = 8123
@@ -31,11 +43,16 @@ class Settings(BaseModel):
     app_port: int = 8000
     migration_batch_size: int = 100000
     migration_default_workers: int = 8
+    oracle_arraysize: int = 100000
+    oracle_prefetchrows: int = 100000
+    clickhouse_insert_batch_size: int = 100000
+    migration_parallel_min_rows: int = 100000
 
 
 @lru_cache
 def get_settings() -> Settings:
     load_dotenv()
+    migration_batch_size = _env_positive_int("MIGRATION_BATCH_SIZE", 100000)
     return Settings(
         clickhouse_host=os.getenv("CLICKHOUSE_HOST", ""),
         clickhouse_port=int(os.getenv("CLICKHOUSE_PORT", "8123")),
@@ -53,6 +70,16 @@ def get_settings() -> Settings:
         p5_qa_oracle_dsn=os.getenv("P5_QA_ORACLE_DSN", ""),
         app_host=os.getenv("APP_HOST", "0.0.0.0"),
         app_port=int(os.getenv("APP_PORT", "8000")),
-        migration_batch_size=int(os.getenv("MIGRATION_BATCH_SIZE", "100000")),
-        migration_default_workers=int(os.getenv("MIGRATION_DEFAULT_WORKERS", "8")),
+        migration_batch_size=migration_batch_size,
+        migration_default_workers=_env_positive_int("MIGRATION_DEFAULT_WORKERS", 8),
+        oracle_arraysize=_env_positive_int("ORACLE_ARRAYSIZE", migration_batch_size),
+        oracle_prefetchrows=_env_positive_int("ORACLE_PREFETCHROWS", migration_batch_size),
+        clickhouse_insert_batch_size=_env_positive_int(
+            "CLICKHOUSE_INSERT_BATCH_SIZE",
+            migration_batch_size,
+        ),
+        migration_parallel_min_rows=_env_positive_int(
+            "MIGRATION_PARALLEL_MIN_ROWS",
+            100000,
+        ),
     )

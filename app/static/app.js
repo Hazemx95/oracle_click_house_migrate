@@ -28,6 +28,23 @@ const elements = {
   requestedParallelMode: document.querySelector("#requested-parallel-mode"),
   resolvedParallelMode: document.querySelector("#resolved-parallel-mode"),
   migrationError: document.querySelector("#migration-error"),
+  diagTotalDuration: document.querySelector("#diag-total-duration"),
+  diagOracleCount: document.querySelector("#diag-oracle-count"),
+  diagOracleExecute: document.querySelector("#diag-oracle-execute"),
+  diagOracleFetch: document.querySelector("#diag-oracle-fetch"),
+  diagRowConversion: document.querySelector("#diag-row-conversion"),
+  diagClickhouseInsert: document.querySelector("#diag-clickhouse-insert"),
+  diagValidation: document.querySelector("#diag-validation"),
+  diagBatchSize: document.querySelector("#diag-batch-size"),
+  diagAverageRows: document.querySelector("#diag-average-rows"),
+  diagAverageSeconds: document.querySelector("#diag-average-seconds"),
+  diagnosticsWarnings: document.querySelector("#diagnostics-warnings"),
+  validationSummary: document.querySelector("#validation-summary"),
+  sourceRowCount: document.querySelector("#source-row-count"),
+  targetRowCount: document.querySelector("#target-row-count"),
+  countMatch: document.querySelector("#count-match"),
+  validationStatus: document.querySelector("#validation-status"),
+  validationError: document.querySelector("#validation-error"),
   workerProgressBody: document.querySelector("#worker-progress-body"),
 };
 
@@ -186,6 +203,27 @@ function formatMode(value) {
   return String(value || "pending").replaceAll("_", " ");
 }
 
+function formatSeconds(value) {
+  return `${Number(value || 0).toFixed(3)}s`;
+}
+
+function formatOptionalNumber(value) {
+  return value === null || value === undefined ? "-" : formatNumber(value);
+}
+
+function formatCountMatch(value) {
+  if (value === null || value === undefined) {
+    return "-";
+  }
+  return value ? "Yes" : "No";
+}
+
+function rowCountDifference(status) {
+  const sourceCount = Number(status.source_row_count || 0);
+  const targetCount = Number(status.target_row_count || 0);
+  return Math.abs(sourceCount - targetCount);
+}
+
 function renderWorkers(workers) {
   const rows = Array.isArray(workers) ? workers : [];
   elements.workerProgressBody.replaceChildren();
@@ -193,7 +231,7 @@ function renderWorkers(workers) {
   if (!rows.length) {
     const row = document.createElement("tr");
     const cell = document.createElement("td");
-    cell.colSpan = 10;
+    cell.colSpan = 13;
     cell.textContent = "No worker progress yet.";
     row.appendChild(cell);
     elements.workerProgressBody.appendChild(row);
@@ -205,6 +243,7 @@ function renderWorkers(workers) {
     const rangeText = worker.range_start === null && worker.range_end === null
       ? "hash bucket"
       : `${worker.range_start ?? ""} to ${worker.range_end ?? ""}`;
+    const timings = worker.timings || {};
     const values = [
       worker.worker_id,
       formatMode(worker.resolved_parallel_mode || worker.partition_mode),
@@ -215,6 +254,9 @@ function renderWorkers(workers) {
       formatNumber(worker.inserted_rows),
       formatNumber(worker.batches_completed),
       formatNumber(worker.rows_per_second),
+      formatSeconds(timings.oracle_fetch_duration_seconds),
+      formatSeconds(timings.row_conversion_duration_seconds),
+      formatSeconds(timings.clickhouse_insert_duration_seconds),
       worker.error_message || "",
     ];
 
@@ -225,6 +267,67 @@ function renderWorkers(workers) {
     }
     elements.workerProgressBody.appendChild(row);
   }
+}
+
+function renderDiagnostics(status) {
+  const diagnostics = status.performance_diagnostics || {};
+  elements.diagTotalDuration.textContent = formatSeconds(diagnostics.total_duration_seconds);
+  elements.diagOracleCount.textContent = formatSeconds(diagnostics.oracle_count_duration_seconds);
+  elements.diagOracleExecute.textContent = formatSeconds(diagnostics.oracle_execute_duration_seconds);
+  elements.diagOracleFetch.textContent = formatSeconds(diagnostics.oracle_fetch_duration_seconds);
+  elements.diagRowConversion.textContent = formatSeconds(diagnostics.row_conversion_duration_seconds);
+  elements.diagClickhouseInsert.textContent = formatSeconds(diagnostics.clickhouse_insert_duration_seconds);
+  elements.diagValidation.textContent = formatSeconds(diagnostics.validation_duration_seconds);
+  elements.diagBatchSize.textContent = formatNumber(diagnostics.batch_size);
+  elements.diagAverageRows.textContent = formatNumber(diagnostics.average_rows_per_batch);
+  elements.diagAverageSeconds.textContent = formatSeconds(diagnostics.average_seconds_per_batch);
+
+  const warnings = Array.isArray(status.warnings) ? status.warnings : [];
+  elements.diagnosticsWarnings.replaceChildren();
+  if (!warnings.length) {
+    const item = document.createElement("li");
+    item.textContent = "No warnings.";
+    elements.diagnosticsWarnings.appendChild(item);
+    return;
+  }
+  for (const warning of warnings) {
+    const item = document.createElement("li");
+    item.textContent = warning;
+    elements.diagnosticsWarnings.appendChild(item);
+  }
+}
+
+function renderValidation(status) {
+  const validationStatus = status.validation_status || "NOT_STARTED";
+  elements.validationStatus.textContent = validationStatus;
+  elements.sourceRowCount.textContent = formatOptionalNumber(status.source_row_count);
+  elements.targetRowCount.textContent = formatOptionalNumber(status.target_row_count);
+  elements.countMatch.textContent = formatCountMatch(status.count_match);
+
+  elements.validationError.hidden = true;
+  elements.validationError.textContent = "";
+
+  if (validationStatus === "RUNNING") {
+    elements.validationSummary.textContent = "Validation running...";
+    return;
+  }
+
+  if (validationStatus === "SUCCESS") {
+    elements.validationSummary.textContent = "Validation succeeded: Oracle and ClickHouse row counts match.";
+    return;
+  }
+
+  if (validationStatus === "FAILED") {
+    const difference = rowCountDifference(status);
+    elements.validationSummary.textContent = `Validation failed. Row count difference: ${formatNumber(difference)}.`;
+    if (status.validation_error_message) {
+      elements.validationError.hidden = false;
+      elements.validationError.textContent = status.validation_error_message;
+    }
+    return;
+  }
+
+  elements.validationSummary.textContent = "Validation has not started.";
 }
 
 function setProgress(status) {
@@ -244,6 +347,8 @@ function setProgress(status) {
   );
   elements.requestedParallelMode.textContent = formatMode(status.requested_parallel_mode);
   elements.resolvedParallelMode.textContent = formatMode(status.resolved_parallel_mode);
+  renderDiagnostics(status);
+  renderValidation(status);
   renderWorkers(status.workers);
 
   if (status.error_message) {

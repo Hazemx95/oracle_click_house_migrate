@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time as datetime_time
 from decimal import Decimal
 from threading import Thread
-from typing import Any
+from time import perf_counter
+from typing import Any, Iterator
 
 from app.config import TARGET_DATABASE, get_settings
 from app.db import clickhouse_client, oracle_client
@@ -19,6 +20,7 @@ MODE_TO_PARTITION = {
     "date_range": "date",
     "hash": "hash",
 }
+SMALL_TABLE_WARNING = "Small table detected; single-thread mode may be faster than parallel mode."
 
 
 @dataclass(frozen=True)
@@ -34,6 +36,7 @@ class InitialLoadRequest:
     resolved_parallel_mode: str = "single"
     partition_mode: str = "single"
     warning_message: str | None = None
+    partition_column_scale: int | None = None
     target_database: str = TARGET_DATABASE
 
 
@@ -46,13 +49,24 @@ class PartitionRange:
     include_nulls: bool = False
 
 
-def _safe_error_message(exc: Exception) -> str:
+def _safe_error_message(exc: Exception, step: str | None = None) -> str:
     settings = get_settings()
     message = str(exc) or exc.__class__.__name__
     for secret in (settings.p5_qa_oracle_password, settings.clickhouse_pass):
         if secret:
             message = message.replace(secret, "***")
+    if step and not message.startswith(f"{step}:"):
+        message = f"{step}: {message}"
     return message
+
+
+def _record_timing(job_id: str, field: str, started_at: float) -> None:
+    job_service.add_diagnostic_timing(job_id, field, perf_counter() - started_at)
+
+
+def _chunk_rows(rows: list[Any], chunk_size: int) -> Iterator[list[Any]]:
+    for index in range(0, len(rows), chunk_size):
+        yield rows[index : index + chunk_size]
 
 
 def _clean(value: str | None) -> str:
@@ -196,7 +210,12 @@ def _bound_for_sql(value: Decimal) -> int | float | Decimal:
     return value
 
 
-def compute_numeric_ranges(min_value: Any, max_value: Any, workers: int) -> list[PartitionRange]:
+def compute_numeric_ranges(
+    min_value: Any,
+    max_value: Any,
+    workers: int,
+    integer_boundaries: bool = False,
+) -> list[PartitionRange]:
     worker_count = clamp_worker_count(workers)
     if min_value is None or max_value is None:
         return [
@@ -223,6 +242,31 @@ def compute_numeric_ranges(min_value: Any, max_value: Any, workers: int) -> list
                 include_nulls=True,
             )
         ]
+
+    if integer_boundaries:
+        start_int = int(start_value)
+        end_int = int(end_value)
+        value_count = end_int - start_int + 1
+        range_count = min(worker_count, value_count)
+        base_width = value_count // range_count
+        remainder = value_count % range_count
+        ranges: list[PartitionRange] = []
+        current = start_int
+        for worker_id in range(range_count):
+            width = base_width + (1 if worker_id < remainder else 0)
+            is_final = worker_id == range_count - 1
+            next_value = end_int if is_final else current + width
+            ranges.append(
+                PartitionRange(
+                    worker_id=worker_id,
+                    start=current,
+                    end=next_value,
+                    inclusive_end=is_final,
+                    include_nulls=worker_id == 0,
+                )
+            )
+            current = next_value
+        return ranges
 
     step = (end_value - start_value) / Decimal(worker_count)
     ranges: list[PartitionRange] = []
@@ -325,12 +369,131 @@ def _normalize_batch(rows: list[Any]) -> list[tuple[Any, ...]]:
     return normalized
 
 
-def _count_source_rows(schema: str, table: str) -> int:
-    sql = f"SELECT COUNT(*) FROM {_oracle_table_path(schema, table)}"
+def _ensure_source_exists(source_schema: str, source_table: str) -> None:
+    if not metadata_service.schema_exists(source_schema):
+        raise ValueError(f"source schema '{source_schema}' not found")
+    if not metadata_service.table_exists(source_schema, source_table):
+        raise ValueError(f"source table '{source_schema}.{source_table}' not found")
+
+
+def _oracle_row_count(source_schema: str, source_table: str) -> int:
+    sql = f"SELECT COUNT(*) FROM {_oracle_table_path(source_schema, source_table)}"
     rows = oracle_client.run_select(sql)
     if not rows:
         return 0
     return int(_first_value(rows[0]) or 0)
+
+
+def count_source(schema: str, table: str) -> int:
+    _ensure_source_exists(schema, table)
+    return _oracle_row_count(schema, table)
+
+
+def get_oracle_row_count(source_schema: str, source_table: str) -> int:
+    return count_source(source_schema, source_table)
+
+
+def count_target(target_table: str, target_database: str = TARGET_DATABASE) -> int:
+    return clickhouse_client.count_rows(target_table, target_database)
+
+
+def get_clickhouse_row_count(target_database: str, target_table: str) -> int:
+    return count_target(target_table, target_database)
+
+
+def _row_count_mismatch_message(source_count: int, target_count: int) -> str:
+    return (
+        "Row count mismatch: Oracle source has "
+        f"{source_count} rows, ClickHouse target has {target_count} rows."
+    )
+
+
+def _mark_validation_mismatch(
+    job_id: str,
+    message: str,
+    source_count: int,
+    target_count: int,
+) -> None:
+    job_service.update_job(
+        job_id,
+        status=job_service.JobStatus.FAILED,
+        error_message=message,
+        source_row_count=source_count,
+        target_row_count=target_count,
+        count_match=False,
+        validation_status=job_service.ValidationStatus.FAILED.value,
+        validation_error_message=message,
+    )
+
+
+def _mark_validation_unavailable(
+    job_id: str,
+    message: str,
+    source_count: int | None = None,
+    target_count: int | None = None,
+) -> None:
+    job_service.update_job(
+        job_id,
+        status=job_service.JobStatus.SUCCESS,
+        error_message=None,
+        source_row_count=source_count,
+        target_row_count=target_count,
+        count_match=None,
+        validation_status=job_service.ValidationStatus.FAILED.value,
+        validation_error_message=message,
+    )
+
+
+def _mark_validation_success(
+    job_id: str,
+    source_count: int,
+    target_count: int,
+) -> None:
+    job_service.update_job(
+        job_id,
+        status=job_service.JobStatus.SUCCESS,
+        source_row_count=source_count,
+        target_row_count=target_count,
+        count_match=True,
+        validation_status=job_service.ValidationStatus.SUCCESS.value,
+        validation_error_message=None,
+    )
+
+
+def run_validation(job_id: str) -> None:
+    validation_started_at = perf_counter()
+    job = job_service.get_job(job_id)
+    if job is None:
+        raise KeyError(f"job '{job_id}' not found")
+
+    job_service.update_job(
+        job_id,
+        validation_status=job_service.ValidationStatus.RUNNING.value,
+        validation_error_message=None,
+    )
+    source_count: int | None = None
+    target_count: int | None = None
+    try:
+        source_count = count_source(
+            str(job.get("source_schema") or ""),
+            str(job.get("source_table") or ""),
+        )
+        target_count = count_target(
+            str(job.get("target_table") or ""),
+            str(job.get("target_database") or TARGET_DATABASE),
+        )
+        count_match = source_count == target_count
+        if count_match:
+            _mark_validation_success(job_id, source_count, target_count)
+            return
+
+        message = _row_count_mismatch_message(source_count, target_count)
+        _mark_validation_mismatch(job_id, message, source_count, target_count)
+    except Exception as exc:  # noqa: BLE001 - validation failure is stored on the job
+        message = _safe_error_message(exc, "validation")
+        _mark_validation_unavailable(job_id, message, source_count, target_count)
+    finally:
+        _record_timing(job_id, "validation_duration_seconds", validation_started_at)
 
 
 def _select_source_sql(schema: str, table: str, column_names: list[str]) -> str:
@@ -398,8 +561,12 @@ def _prepare_recreate(
     target_table = str(recreate["target_table"])
     job_service.update_job(job_id, target_table=target_table)
 
-    clickhouse_client.execute_ddl(str(recreate["drop_ddl"]))
-    clickhouse_client.execute_ddl(str(recreate["create_ddl"]))
+    started_at = perf_counter()
+    try:
+        clickhouse_client.execute_ddl(str(recreate["drop_ddl"]))
+        clickhouse_client.execute_ddl(str(recreate["create_ddl"]))
+    finally:
+        _record_timing(job_id, "ddl_duration_seconds", started_at)
     return columns, _column_names(columns), target_table
 
 
@@ -425,6 +592,10 @@ def _build_request(
         column_metadata,
         clamp_worker_count(workers),
     )
+    partition_metadata = _find_column(_clean(partition_column) or None, column_metadata)
+    partition_column_scale = None
+    if partition_metadata is not None and partition_metadata.get("data_scale") is not None:
+        partition_column_scale = int(partition_metadata["data_scale"])
 
     return InitialLoadRequest(
         source_schema=_clean(source_schema),
@@ -440,8 +611,29 @@ def _build_request(
         warning_message=mode_resolution["warning_message"]
         if isinstance(mode_resolution["warning_message"], str)
         else None,
+        partition_column_scale=partition_column_scale,
         target_database=target_database,
     )
+
+
+def apply_small_table_rule(
+    request: InitialLoadRequest,
+    total_rows: int,
+) -> tuple[InitialLoadRequest, str | None]:
+    settings = get_settings()
+    if total_rows >= settings.migration_parallel_min_rows:
+        return request, None
+    if request.requested_parallel_mode == "auto":
+        return (
+            replace(
+                request,
+                workers=1,
+                resolved_parallel_mode="single",
+                partition_mode="single",
+            ),
+            SMALL_TABLE_WARNING,
+        )
+    return request, SMALL_TABLE_WARNING
 
 
 def launch_initial_load(
@@ -501,6 +693,46 @@ def launch_initial_load(
     return job_id
 
 
+def _add_metadata_warnings(job_id: str, request: InitialLoadRequest) -> None:
+    try:
+        heavy_columns = metadata_service.detect_heavy_columns(
+            request.source_schema,
+            request.source_table,
+        )
+        if heavy_columns:
+            names = ", ".join(
+                f"{column.get('column_name')} ({column.get('data_type')})"
+                for column in heavy_columns
+            )
+            job_service.add_warning(
+                job_id,
+                f"Heavy LOB columns detected ({names}) - per-LOB reads may dominate fetch time.",
+            )
+    except Exception as exc:  # noqa: BLE001 - diagnostics warnings must not block migration
+        job_service.add_warning(
+            job_id,
+            f"Unable to evaluate heavy column warning: {_safe_error_message(exc)}",
+        )
+
+    if request.partition_mode not in {"numeric", "date"} or not request.partition_column:
+        return
+    try:
+        if not metadata_service.is_column_indexed(
+            request.source_schema,
+            request.source_table,
+            request.partition_column,
+        ):
+            job_service.add_warning(
+                job_id,
+                "Range mode on a non-indexed column may be slow.",
+            )
+    except Exception as exc:  # noqa: BLE001 - diagnostics warnings must not block migration
+        job_service.add_warning(
+            job_id,
+            f"Unable to evaluate range-column index warning: {_safe_error_message(exc)}",
+        )
+
+
 def _copy_batches(
     *,
     select_sql: str,
@@ -511,34 +743,101 @@ def _copy_batches(
     job_id: str,
     worker_id: int | None = None,
 ) -> tuple[int, int, int]:
+    settings = get_settings()
     clickhouse = None
     processed_rows = 0
     inserted_rows = 0
     batches_completed = 0
+    step = "oracle_connect"
+    worker_timings = {
+        "oracle_execute_duration_seconds": 0.0,
+        "oracle_fetch_duration_seconds": 0.0,
+        "row_conversion_duration_seconds": 0.0,
+        "clickhouse_insert_duration_seconds": 0.0,
+        "batches_completed": 0,
+        "average_seconds_per_batch": 0.0,
+    }
     try:
         clickhouse = clickhouse_client.get_client()
         with oracle_client.get_connection() as connection:
             with connection.cursor() as cursor:
-                cursor.arraysize = request.batch_size
-                cursor.prefetchrows = request.batch_size
+                cursor.arraysize = settings.oracle_arraysize
+                cursor.prefetchrows = settings.oracle_prefetchrows
+                step = "oracle_execute"
+                started_at = perf_counter()
                 cursor.execute(select_sql, binds or {})
+                elapsed = perf_counter() - started_at
+                worker_timings["oracle_execute_duration_seconds"] += elapsed
+                job_service.add_diagnostic_timing(
+                    job_id,
+                    "oracle_execute_duration_seconds",
+                    elapsed,
+                )
 
                 while True:
+                    step = "oracle_fetch"
+                    started_at = perf_counter()
                     batch = cursor.fetchmany(request.batch_size)
+                    elapsed = perf_counter() - started_at
+                    worker_timings["oracle_fetch_duration_seconds"] += elapsed
+                    job_service.add_diagnostic_timing(
+                        job_id,
+                        "oracle_fetch_duration_seconds",
+                        elapsed,
+                    )
                     if not batch:
                         break
 
+                    step = "row_conversion"
+                    started_at = perf_counter()
                     normalized_batch = _normalize_batch(batch)
-                    inserted = clickhouse_client.insert_rows(
-                        target_table,
-                        normalized_batch,
-                        column_names,
-                        request.target_database,
-                        clickhouse,
+                    elapsed = perf_counter() - started_at
+                    worker_timings["row_conversion_duration_seconds"] += elapsed
+                    job_service.add_diagnostic_timing(
+                        job_id,
+                        "row_conversion_duration_seconds",
+                        elapsed,
                     )
+
+                    inserted = 0
+                    for insert_chunk in _chunk_rows(
+                        normalized_batch,
+                        settings.clickhouse_insert_batch_size,
+                    ):
+                        step = "clickhouse_insert"
+                        started_at = perf_counter()
+                        inserted += clickhouse_client.insert_rows(
+                            target_table,
+                            insert_chunk,
+                            column_names,
+                            request.target_database,
+                            clickhouse,
+                        )
+                        elapsed = perf_counter() - started_at
+                        worker_timings["clickhouse_insert_duration_seconds"] += elapsed
+                        job_service.add_diagnostic_timing(
+                            job_id,
+                            "clickhouse_insert_duration_seconds",
+                            elapsed,
+                        )
                     processed_rows += len(batch)
                     inserted_rows += inserted
                     batches_completed += 1
+                    worker_timings["batches_completed"] = batches_completed
+                    copy_seconds = sum(
+                        float(worker_timings[key])
+                        for key in (
+                            "oracle_execute_duration_seconds",
+                            "oracle_fetch_duration_seconds",
+                            "row_conversion_duration_seconds",
+                            "clickhouse_insert_duration_seconds",
+                        )
+                    )
+                    worker_timings["average_seconds_per_batch"] = (
+                        round(copy_seconds / batches_completed, 3)
+                        if batches_completed
+                        else 0.0
+                    )
                     if worker_id is None:
                         job_service.update_job(
                             job_id,
@@ -554,9 +853,14 @@ def _copy_batches(
                             processed_rows=processed_rows,
                             inserted_rows=inserted_rows,
                             batches_completed=batches_completed,
+                            timings=dict(worker_timings),
                         )
         return processed_rows, inserted_rows, batches_completed
+    except Exception as exc:  # noqa: BLE001 - caller stores credential-free step failure
+        raise RuntimeError(_safe_error_message(exc, step)) from exc
     finally:
+        if worker_id is not None:
+            job_service.set_worker_diagnostics(job_id, worker_id, dict(worker_timings))
         if clickhouse is not None and hasattr(clickhouse, "close"):
             clickhouse.close()
 
@@ -611,7 +915,12 @@ def _build_worker_ranges(request: InitialLoadRequest) -> list[PartitionRange]:
         request.partition_column,
     )
     if request.partition_mode == "numeric":
-        return compute_numeric_ranges(min_value, max_value, request.workers)
+        return compute_numeric_ranges(
+            min_value,
+            max_value,
+            request.workers,
+            integer_boundaries=request.partition_column_scale == 0,
+        )
     if request.partition_mode == "date":
         return compute_date_ranges(min_value, max_value, request.workers)
     raise ValueError(f"unsupported partition mode '{request.partition_mode}'")
@@ -673,7 +982,12 @@ def run_parallel(
     target_table: str,
     column_names: list[str],
 ) -> None:
-    ranges = _build_worker_ranges(request)
+    started_at = perf_counter()
+    try:
+        ranges = _build_worker_ranges(request)
+    finally:
+        if request.partition_mode in {"numeric", "date"}:
+            _record_timing(job_id, "range_discovery_duration_seconds", started_at)
     if not ranges:
         job_service.set_workers(job_id, [])
         return
@@ -707,16 +1021,32 @@ def run_parallel(
 def run_initial_load(job_id: str, request: InitialLoadRequest) -> None:
     try:
         job_service.update_job(job_id, status=job_service.JobStatus.RUNNING)
-        _columns, column_names, target_table = _prepare_recreate(job_id, request)
-
-        total_rows = _count_source_rows(request.source_schema, request.source_table)
-        job_service.update_job(job_id, total_rows=total_rows, remaining_rows=total_rows)
-        if total_rows == 0:
+        _ensure_source_exists(request.source_schema, request.source_table)
+        if request.warning_message:
+            job_service.add_warning(job_id, request.warning_message)
+        _add_metadata_warnings(job_id, request)
+        count_started_at = perf_counter()
+        try:
+            total_rows = _oracle_row_count(
+                request.source_schema,
+                request.source_table,
+            )
+        finally:
+            _record_timing(job_id, "oracle_count_duration_seconds", count_started_at)
+        request, small_table_warning = apply_small_table_rule(request, total_rows)
+        if small_table_warning:
+            job_service.add_warning(job_id, small_table_warning)
             job_service.update_job(
                 job_id,
-                status=job_service.JobStatus.SUCCESS,
-                progress_percent=100.0,
+                worker_count=request.workers,
+                resolved_parallel_mode=request.resolved_parallel_mode,
+                partition_mode=request.partition_mode,
             )
+
+        _columns, column_names, target_table = _prepare_recreate(job_id, request)
+        job_service.update_job(job_id, total_rows=total_rows, remaining_rows=total_rows)
+        if total_rows == 0:
+            run_validation(job_id)
             return
 
         if request.resolved_parallel_mode == "single":
@@ -741,12 +1071,12 @@ def run_initial_load(job_id: str, request: InitialLoadRequest) -> None:
 
         job_service.update_job(
             job_id,
-            status=job_service.JobStatus.SUCCESS,
             processed_rows=processed_rows,
             inserted_rows=inserted_rows,
             remaining_rows=0,
             progress_percent=100.0,
         )
+        run_validation(job_id)
     except Exception as exc:  # noqa: BLE001 - job surfaces a credential-free failure
         job_service.update_job(
             job_id,
