@@ -6,6 +6,7 @@ const elements = {
   sourceSchema: document.querySelector("#source-schema"),
   sourceTable: document.querySelector("#source-table"),
   partitionColumn: document.querySelector("#partition-column"),
+  parallelMode: document.querySelector("#parallel-mode"),
   targetSchema: document.querySelector("#target-schema"),
   clickhouseDatabase: document.querySelector("#clickhouse-database"),
   targetTable: document.querySelector("#target-table"),
@@ -24,7 +25,10 @@ const elements = {
   elapsedSeconds: document.querySelector("#elapsed-seconds"),
   rowsPerSecond: document.querySelector("#rows-per-second"),
   currentBatch: document.querySelector("#current-batch"),
+  requestedParallelMode: document.querySelector("#requested-parallel-mode"),
+  resolvedParallelMode: document.querySelector("#resolved-parallel-mode"),
   migrationError: document.querySelector("#migration-error"),
+  workerProgressBody: document.querySelector("#worker-progress-body"),
 };
 
 let activePollTimer = null;
@@ -151,12 +155,12 @@ async function loadPartitionColumns(schema, table) {
 
   try {
     const query = new URLSearchParams({ schema, table });
-    const data = await fetchJson(`/api/oracle/partition-columns?${query.toString()}`);
-    const columns = (data.candidates || []).map((column) => ({
+    const data = await fetchJson(`/api/oracle/columns?${query.toString()}`);
+    const columns = (data.columns || []).map((column) => ({
       value: column.column_name,
       label: `${column.column_name} (${column.data_type})`,
     }));
-    setOptions(elements.partitionColumn, columns, "No partition/hash column");
+    setOptions(elements.partitionColumn, columns, "Select a partition/hash column");
     elements.partitionColumn.disabled = false;
   } catch (error) {
     setOptions(elements.partitionColumn, [], safeErrorMessage(error));
@@ -178,6 +182,51 @@ function formatNumber(value) {
   return Number(value || 0).toLocaleString();
 }
 
+function formatMode(value) {
+  return String(value || "pending").replaceAll("_", " ");
+}
+
+function renderWorkers(workers) {
+  const rows = Array.isArray(workers) ? workers : [];
+  elements.workerProgressBody.replaceChildren();
+
+  if (!rows.length) {
+    const row = document.createElement("tr");
+    const cell = document.createElement("td");
+    cell.colSpan = 10;
+    cell.textContent = "No worker progress yet.";
+    row.appendChild(cell);
+    elements.workerProgressBody.appendChild(row);
+    return;
+  }
+
+  for (const worker of rows) {
+    const row = document.createElement("tr");
+    const rangeText = worker.range_start === null && worker.range_end === null
+      ? "hash bucket"
+      : `${worker.range_start ?? ""} to ${worker.range_end ?? ""}`;
+    const values = [
+      worker.worker_id,
+      formatMode(worker.resolved_parallel_mode || worker.partition_mode),
+      worker.partition_column || "-",
+      rangeText,
+      worker.status || "PENDING",
+      formatNumber(worker.processed_rows),
+      formatNumber(worker.inserted_rows),
+      formatNumber(worker.batches_completed),
+      formatNumber(worker.rows_per_second),
+      worker.error_message || "",
+    ];
+
+    for (const value of values) {
+      const cell = document.createElement("td");
+      cell.textContent = value;
+      row.appendChild(cell);
+    }
+    elements.workerProgressBody.appendChild(row);
+  }
+}
+
 function setProgress(status) {
   const percent = Math.max(0, Math.min(100, Number(status.progress_percent || 0)));
   elements.progressPanel.hidden = false;
@@ -193,6 +242,9 @@ function setProgress(status) {
   elements.currentBatch.textContent = formatNumber(
     status.current_batch_number || status.current_batch,
   );
+  elements.requestedParallelMode.textContent = formatMode(status.requested_parallel_mode);
+  elements.resolvedParallelMode.textContent = formatMode(status.resolved_parallel_mode);
+  renderWorkers(status.workers);
 
   if (status.error_message) {
     elements.migrationError.hidden = false;
@@ -284,6 +336,7 @@ async function onLaunchClick() {
     target_database: TARGET_DATABASE,
     target_table: elements.targetTable.value.trim(),
     partition_column: elements.partitionColumn.value || null,
+    parallel_mode: elements.parallelMode.value || "auto",
     workers: Number(elements.workerThreads.value || 1),
   };
 
@@ -301,7 +354,12 @@ async function onLaunchClick() {
     });
 
     elements.jobIdText.textContent = `Job ${response.job_id}`;
+    elements.requestedParallelMode.textContent = formatMode(response.requested_parallel_mode);
+    elements.resolvedParallelMode.textContent = formatMode(response.resolved_parallel_mode);
     elements.launchMessage.textContent = `Migration job ${response.job_id} started. Polling live status.`;
+    if (response.warning_message) {
+      elements.launchMessage.textContent += ` ${response.warning_message}`;
+    }
     startPolling(response.job_id);
   } catch (error) {
     elements.launchButton.disabled = false;

@@ -40,6 +40,17 @@ def _duration_seconds(started_at_ts: object, finished_at_ts: object | None = Non
 
 
 def _apply_derived_progress(job: dict[str, object]) -> None:
+    workers = job.get("workers")
+    if isinstance(workers, list) and workers:
+        processed_rows = sum(int(worker.get("processed_rows") or 0) for worker in workers)
+        inserted_rows = sum(int(worker.get("inserted_rows") or 0) for worker in workers)
+        batches_completed = sum(int(worker.get("batches_completed") or 0) for worker in workers)
+        job["processed_rows"] = processed_rows
+        job["inserted_rows"] = inserted_rows
+        job["batches_completed"] = batches_completed
+        job["current_batch"] = batches_completed
+        job["current_batch_number"] = batches_completed
+
     total_rows = int(job.get("total_rows") or 0)
     processed_rows = int(job.get("processed_rows") or 0)
     remaining_rows = max(total_rows - processed_rows, 0) if total_rows else 0
@@ -58,6 +69,11 @@ def _apply_derived_progress(job: dict[str, object]) -> None:
 
 def _public_job(job: dict[str, object]) -> dict[str, object]:
     public = {key: value for key, value in job.items() if not key.startswith("_")}
+    public["workers"] = [
+        {key: value for key, value in worker.items() if not key.startswith("_")}
+        for worker in public.get("workers", [])
+        if isinstance(worker, dict)
+    ]
     return deepcopy(public)
 
 
@@ -69,7 +85,11 @@ def create_job(
     target_database: str = TARGET_DATABASE,
     target_schema: str | None = None,
     partition_column: str | None = None,
+    partition_mode: str = "single",
     worker_count: int = 1,
+    requested_parallel_mode: str = "auto",
+    resolved_parallel_mode: str = "single",
+    warning_message: str | None = None,
     batch_size: int | None = None,
 ) -> str:
     job_id = str(uuid4())
@@ -81,8 +101,10 @@ def create_job(
         "target_schema": target_schema,
         "target_table": target_table,
         "partition_column": partition_column,
-        "partition_mode": "single",
-        "worker_count": 1,
+        "partition_mode": partition_mode,
+        "requested_parallel_mode": requested_parallel_mode,
+        "resolved_parallel_mode": resolved_parallel_mode,
+        "worker_count": worker_count,
         "requested_workers": worker_count,
         "batch_size": batch_size,
         "status": JobStatus.PENDING.value,
@@ -100,6 +122,7 @@ def create_job(
         "elapsed_seconds": 0.0,
         "rows_per_second": 0.0,
         "error_message": None,
+        "warning_message": warning_message,
         "workers": [],
     }
     with _LOCK:
@@ -148,6 +171,55 @@ def update_job(job_id: str, **fields: object) -> dict[str, object]:
         return _public_job(job)
 
 
+def set_workers(job_id: str, workers: list[dict[str, object]]) -> dict[str, object]:
+    with _LOCK:
+        job = _JOBS.get(job_id)
+        if job is None:
+            raise KeyError(f"job '{job_id}' not found")
+        job["workers"] = deepcopy(workers)
+        _apply_derived_progress(job)
+        return _public_job(job)
+
+
+def update_worker(job_id: str, worker_id: int, **fields: object) -> dict[str, object]:
+    with _LOCK:
+        job = _JOBS.get(job_id)
+        if job is None:
+            raise KeyError(f"job '{job_id}' not found")
+
+        workers = job.get("workers")
+        if not isinstance(workers, list):
+            raise ValueError("job has no worker registry")
+
+        worker = next(
+            (
+                item
+                for item in workers
+                if isinstance(item, dict) and item.get("worker_id") == worker_id
+            ),
+            None,
+        )
+        if worker is None:
+            raise KeyError(f"worker '{worker_id}' not found")
+
+        status = fields.get("status")
+        if isinstance(status, JobStatus):
+            fields["status"] = status.value
+
+        if fields.get("status") == JobStatus.RUNNING.value and not worker.get("_started_at_ts"):
+            worker["_started_at_ts"] = time()
+
+        worker.update(fields)
+        elapsed_seconds = _duration_seconds(worker.get("_started_at_ts"))
+        worker["rows_per_second"] = (
+            round(int(worker.get("processed_rows") or 0) / elapsed_seconds, 2)
+            if elapsed_seconds > 0
+            else 0.0
+        )
+        _apply_derived_progress(job)
+        return _public_job(job)
+
+
 def get_status(job_id: str) -> dict[str, object] | None:
     job = get_job(job_id)
     if job is None:
@@ -160,6 +232,12 @@ def get_status(job_id: str) -> dict[str, object] | None:
         "source_table",
         "target_database",
         "target_table",
+        "partition_column",
+        "partition_mode",
+        "worker_count",
+        "requested_workers",
+        "requested_parallel_mode",
+        "resolved_parallel_mode",
         "total_rows",
         "processed_rows",
         "inserted_rows",
@@ -171,6 +249,7 @@ def get_status(job_id: str) -> dict[str, object] | None:
         "elapsed_seconds",
         "rows_per_second",
         "error_message",
+        "warning_message",
         "workers",
     ]
     return {key: job.get(key) for key in keys}

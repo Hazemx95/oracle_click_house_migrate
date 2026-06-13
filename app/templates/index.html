@@ -58,6 +58,20 @@
                 </select>
               </label>
 
+              <label for="parallel-mode">
+                Parallel Mode
+                <select id="parallel-mode" name="parallel_mode">
+                  <option value="auto" selected>Auto</option>
+                  <option value="numeric_range">Numeric Range</option>
+                  <option value="date_range">Date Range</option>
+                  <option value="hash">Hash</option>
+                </select>
+                <span class="field-help">
+                  Auto uses the column datatype. Numeric requires NUMBER; Date requires DATE/TIMESTAMP;
+                  Hash uses ORA_HASH and requires a selected column.
+                </span>
+              </label>
+
               <label for="worker-threads">
                 Worker Threads
                 <input id="worker-threads" name="workers" type="number" min="1" max="16" value="8">
@@ -139,9 +153,42 @@
               <dt>Current Batch</dt>
               <dd id="current-batch">0</dd>
             </div>
+            <div>
+              <dt>Requested Mode</dt>
+              <dd id="requested-parallel-mode">auto</dd>
+            </div>
+            <div>
+              <dt>Resolved Mode</dt>
+              <dd id="resolved-parallel-mode">pending</dd>
+            </div>
           </dl>
 
           <p class="error-message" id="migration-error" hidden></p>
+
+          <section class="worker-progress" aria-label="Worker progress">
+            <h3>Worker Progress</h3>
+            <div class="worker-table-wrap">
+              <table class="worker-table">
+                <thead>
+                  <tr>
+                    <th>Worker</th>
+                    <th>Mode</th>
+                    <th>Column</th>
+                    <th>Range</th>
+                    <th>Status</th>
+                    <th>Processed</th>
+                    <th>Inserted</th>
+                    <th>Batches</th>
+                    <th>Rows/s</th>
+                    <th>Error</th>
+                  </tr>
+                </thead>
+                <tbody id="worker-progress-body">
+                  <tr><td colspan="10">No worker progress yet.</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
         </section>
       </section>
     </main>

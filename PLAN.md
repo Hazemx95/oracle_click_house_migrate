@@ -207,6 +207,7 @@ The GUI must include:
 | Oracle Source Schema          | Dropdown              | Loaded dynamically from Oracle            |
 | Oracle Source Table           | Dropdown              | Loaded dynamically after schema selection |
 | Partition/Hash Column         | Dropdown              | Loaded dynamically after table selection  |
+| Parallel Mode                 | Dropdown              | `Auto` / `Numeric Range` / `Date Range` / `Hash`; default `Auto` (Phase 7) |
 | Worker Threads                | Number input          | Default `8`                               |
 | ClickHouse Schema Destination | Text input            | Auto-filled from selected Oracle schema   |
 | ClickHouse Database           | Static/disabled input | Always `oracle_migration_hazem`           |
@@ -1298,20 +1299,104 @@ Use hash mode only when column is non-null and high-cardinality.
 * Each worker must update progress.
 * If any worker fails, job status becomes `FAILED`.
 
+## Parallel Mode Selection (GUI + Backend)
+
+Phase 7 also exposes the parallel technique to the user through a **Parallel Mode** dropdown and resolves/validates it on the backend. This is part of Phase 7, not a separate phase.
+
+### GUI
+
+Add a **Parallel Mode** dropdown near **Partition/Hash Column** and **Worker Threads** with options:
+
+```text
+Auto
+Numeric Range
+Date Range
+Hash
+```
+
+Default is `Auto`. Add helper text explaining each mode:
+
+* **Auto** — backend chooses the best mode from the selected column's datatype.
+* **Numeric Range** — requires a NUMBER column.
+* **Date Range** — requires a DATE or TIMESTAMP column.
+* **Hash** — requires a selected column; uses `ORA_HASH`; can be forced even for NUMBER/DATE columns to override Auto when range distribution is poor.
+
+### Behavior
+
+* **Auto** lets the backend choose the parallel mode based on the selected column datatype.
+* **Numeric Range** requires a NUMBER column.
+* **Date Range** requires a DATE or TIMESTAMP column.
+* **Hash** requires a selected column and uses `ORA_HASH`; it may be used even for a NUMBER or DATE column so the user can override Auto and force Hash mode.
+* If the user chooses a mode that does not match the selected column's datatype, return a **clear validation error before launching the job** (no job is created).
+* If `workers = 1`, allow single-thread behavior even when a parallel mode is selected, **or** clearly warn that parallel mode is only used when `workers > 1`. Never a hard error solely for that reason. Workers remain capped at `16`.
+
+### Backend Requirements
+
+`POST /api/migrations` must accept a field named `parallel_mode`.
+
+Allowed values (default `auto`):
+
+```text
+auto
+numeric_range
+date_range
+hash
+```
+
+The job must store:
+
+```text
+requested_parallel_mode
+resolved_parallel_mode
+```
+
+Auto resolution logic:
+
+* If `parallel_mode = auto` and the selected column type is NUMBER → resolve to `numeric_range`.
+* If `parallel_mode = auto` and the selected column type is DATE or TIMESTAMP → resolve to `date_range`.
+* If `parallel_mode = auto` and the selected column is another valid type → resolve to `hash`.
+* If no valid column/mode can be resolved, fail **before** launching with a clear validation error.
+
+Explicit-mode validation:
+
+* `numeric_range` rejects non-NUMBER columns.
+* `date_range` rejects non-DATE/non-TIMESTAMP columns.
+* `hash` requires a selected column.
+* `workers = 1` must still work.
+* `workers` must still be capped at `16`.
+
+`GET /api/migrations/{job_id}/status` must return `requested_parallel_mode` and `resolved_parallel_mode`, and worker progress rows/cards must show the resolved mode.
+
+Datatype used for resolution/validation is read from Oracle metadata (`all_tab_columns`, read-only) — never trusted from the client. The resolved mode maps onto the internal `partition_mode` engine path (`numeric_range`→`numeric`, `date_range`→`date`, `hash`→`hash`).
+
+### Frontend Requirements
+
+* Add the **Parallel Mode** dropdown to `index.html`.
+* Update `app.js` to send `parallel_mode` in the `POST /api/migrations` request.
+* Add helper text explaining each mode.
+* Display the resolved mode after the job starts.
+* Display the mode in worker progress cards/table.
+
 ## Acceptance Criteria
 
 Phase 7 is complete only when:
 
 * Numeric parallel migration works.
 * Date parallel migration works if date column exists.
-* Hash mode works as fallback.
+* Hash mode works as fallback (and as an explicit override for NUMBER/DATE columns).
 * Worker failures are handled.
-* Total processed rows are tracked.
+* Total processed rows are tracked (per-worker and aggregated overall).
 * No duplicate or missing ranges for numeric/date mode.
+* The Parallel Mode dropdown is visible near Partition/Hash Column and Worker Threads with per-mode helper text.
+* `POST /api/migrations` accepts `parallel_mode`; omitting it defaults to `auto`.
+* Auto resolves correctly by datatype (NUMBER→numeric_range, DATE/TIMESTAMP→date_range, else→hash).
+* A mode conflicting with the selected column's datatype returns a clear pre-launch validation error and creates no job.
+* `requested_parallel_mode` and `resolved_parallel_mode` are returned by status and shown in the GUI (overall + per-worker cards).
+* `workers = 1` with a parallel mode is allowed or clearly warned, never a hard error for that reason; workers stay capped at `16`.
 
 ## Stop Point
 
-Stop after Phase 7. Do not continue until parallel migration is tested on small and medium tables.
+Stop after Phase 7. Do not continue until parallel migration — including Parallel Mode selection, Auto resolution, datatype validation, and requested/resolved display — is tested on small and medium tables. Then continue Phase 8 — Validation, Counts, and Reconciliation.
 
 ---
 

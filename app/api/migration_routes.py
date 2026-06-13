@@ -18,7 +18,8 @@ class MigrationRequest(BaseModel):
     target_database: str = TARGET_DATABASE
     target_table: str
     partition_column: str | None = None
-    workers: int = Field(default=1, ge=1)
+    parallel_mode: str = "auto"
+    workers: int | None = Field(default=None, ge=1)
     batch_size: int | None = Field(default=None, gt=0)
 
 
@@ -43,9 +44,10 @@ def launch_migration(request: MigrationRequest) -> dict[str, Any]:
             target_schema=request.target_schema,
             target_table=request.target_table,
             partition_column=request.partition_column,
-            workers=1,
+            workers=request.workers,
             batch_size=request.batch_size,
             target_database=request.target_database,
+            parallel_mode=request.parallel_mode,
         )
     except ValueError as exc:
         raise _bad_request(str(exc)) from exc
@@ -56,7 +58,14 @@ def launch_migration(request: MigrationRequest) -> dict[str, Any]:
             detail={"status": "error", "error": "migration launch failed"},
         ) from exc
 
-    return {"job_id": job_id, "status": job_service.JobStatus.PENDING.value}
+    job = job_service.get_job(job_id) or {}
+    return {
+        "job_id": job_id,
+        "status": job_service.JobStatus.PENDING.value,
+        "requested_parallel_mode": job.get("requested_parallel_mode"),
+        "resolved_parallel_mode": job.get("resolved_parallel_mode"),
+        "warning_message": job.get("warning_message"),
+    }
 
 
 @router.get("/{job_id}")

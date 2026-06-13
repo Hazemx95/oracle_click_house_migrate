@@ -113,7 +113,8 @@ oracle_click_house_migrate/
 └── tests/
     ├── test_config.py
     ├── test_ddl_mapper.py       # type mapping + naming (added Phase 5)
-    └── test_range_split.py      # numeric/date range splitting (added Phase 7)
+    ├── test_range_split.py      # numeric/date range splitting (added Phase 7)
+    └── test_parallel_mode.py    # parallel-mode resolver/validator (added Phase 7)
 ```
 
 **Structure Decision**: Single FastAPI web-service project exactly as laid out in PLAN.md §9. JSON APIs under `/api/*`, GUI served from `/` via Jinja2 with static assets. One added module `app/api/clickhouse_routes.py` (PLAN.md lists DDL endpoints but no dedicated route file; kept separate from `migration_routes.py` for clarity). Job state lives in `job_service.py` as an in-memory registry through Phase 8; an optional persistent audit table is introduced in Phase 10.
@@ -435,43 +436,85 @@ curl http://localhost:8000/api/migrations/$JOB/status
 
 ---
 
-### Phase 7 — Parallel Migration Engine
+### Phase 7 — Parallel Migration Engine **(with Parallel Mode Selector)**
 
-**Goal**: Faster **initial full load** for large tables via parallel extraction + batch load, preserving the latest-only replace guarantee.
+**Goal**: Faster **initial full load** for large tables via parallel extraction + batch load, preserving the latest-only replace guarantee. Expose the parallel technique to the user via a **Parallel Mode** dropdown (`Auto` / `Numeric Range` / `Date Range` / `Hash`): the backend either honors a concrete mode (validated against the selected column's Oracle datatype) or, in `Auto`, resolves the best mode from that datatype; the job records both the requested and resolved mode and surfaces them in the API and GUI.
 
-**Scope**: Parallel migration after single-thread is stable. Modes: numeric range, date range, hash fallback. Still full-load replace only — no CDC/incremental/dedup/merge/append.
+**Scope**: Parallel migration after single-thread (Phase 6) is stable. Engine modes: numeric range, date range, hash fallback, plus `auto` resolution. User-selectable **Parallel Mode** with pre-launch datatype validation, requested/resolved tracking, and per-worker + overall progress aggregation. Still full-load replace only — no CDC/incremental/dedup/merge/append. The service layer stays framework-agnostic (no FastAPI imports); routes stay thin wrappers.
 
 **Files to create or update**:
-- `app/services/migration_service.py` — keep the drop+create as a **single step performed once** before any worker starts; then add a worker pool that loads partitions of the **full** source: numeric-range splitting (`MIN/MAX`, half-open ranges, final range inclusive), date-range splitting, hash mode (`MOD(ORA_HASH(col), :workers) = :id`); aggregate per-worker progress into the overall job progress; mark job FAILED if any worker fails. Each worker observes the same performance rules as Phase 6 (`arraysize`/`prefetchrows`, `fetchmany`, batch insert, explicit/stable column order). Ranges partition the whole table exactly once (union = full table, no overlap), so parallelism speeds up the same full load without duplicating or skipping rows.
-- `app/services/job_service.py` — add a per-worker progress registry on the job (see fields below); aggregate workers' `processed_rows`/`inserted_rows` into the job totals and recompute `progress_percent`/`rows_per_second`.
+- `app/services/migration_service.py` — keep the drop+create as a **single step performed once** before any worker starts; then add a worker pool that loads partitions of the **full** source: numeric-range splitting (`MIN/MAX`, half-open ranges, final range inclusive), date-range splitting, hash mode (`MOD(ORA_HASH(col), :workers) = :id`); aggregate per-worker progress into the overall job progress; mark job FAILED if any worker fails. Each worker observes the same performance rules as Phase 6 (`arraysize`/`prefetchrows`, `fetchmany`, batch insert, explicit/stable column order). Ranges partition the whole table exactly once (union = full table, no overlap). **Add a pure resolver/validator** `resolve_parallel_mode(parallel_mode, partition_column, column_metadata, workers)` that performs Auto resolution + explicit-mode datatype validation (reading the column datatype from read-only Oracle metadata, never from the client) and returns the concrete resolved mode (or raises a controlled validation error); map the resolved mode onto the internal `partition_mode` (`numeric_range`→`numeric`, `date_range`→`date`, `hash`→`hash`). **No FastAPI imports** — importable from Flask.
+- `app/services/job_service.py` — add a per-worker progress registry on the job (see fields below); aggregate workers' `processed_rows`/`inserted_rows` into the job totals and recompute `progress_percent`/`rows_per_second`; **persist `requested_parallel_mode` and `resolved_parallel_mode` on the job** (in `get_job`/`get_status` output) and carry `resolved_parallel_mode` onto each worker entry.
 - `app/config.py` — `MIGRATION_DEFAULT_WORKERS=8`, enforce max 16.
-- `app/api/migration_routes.py` — thin wrapper: accept and validate `workers` and partition mode/column; `/status` now also returns the `workers` array.
-- `app/static/app.js` + `app/templates/index.html` — render a **per-worker progress table/cards** alongside the overall progress bar.
+- `app/api/migration_routes.py` — thin wrapper: add `parallel_mode: str = "auto"` to the `MigrationRequest` model; accept and validate `workers` and partition column; call `resolve_parallel_mode` **before** creating/launching the job (a validation error → controlled `400`, no job created); `/status` now also returns the `workers` array plus `requested_parallel_mode`/`resolved_parallel_mode`. No business logic in this file.
+- `app/templates/index.html` — add the **Parallel Mode** `<select>` (`Auto` / `Numeric Range` / `Date Range` / `Hash`, default `Auto`) near **Partition/Hash Column** and **Worker Threads**, with per-mode helper text; render a **per-worker progress table/cards** alongside the overall progress bar.
+- `app/static/app.js` — send `parallel_mode` in the `POST /api/migrations` body; after launch display `requested_parallel_mode`/`resolved_parallel_mode`; render the resolved mode on each worker card/row; render per-worker progress from the `workers` array on each poll; surface validation errors (datatype mismatch, missing column, unknown mode) and the single-worker warning.
 - `tests/test_range_split.py` — unit tests proving no overlap/no gaps for numeric and date splits.
+- `tests/test_parallel_mode.py` — pure-function tests over `resolve_parallel_mode`: Auto→numeric_range for NUMBER, Auto→date_range for DATE/TIMESTAMP, Auto→hash otherwise; explicit-mode datatype mismatches rejected; hash requires a column; `workers == 1` single-thread allowance/warning; requested workers above max clamp to 16.
 
-**Per-worker progress fields** (tracked per worker, returned in `/status`): `worker_id`, `partition_mode`, `partition_column`, `range_start`, `range_end`, `status`, `processed_rows`, `inserted_rows`, `batches_completed`, `rows_per_second`, `error_message`.
+**Parallel Mode field model & terminology**:
+- `parallel_mode` (user-facing API field) ∈ `auto` | `numeric_range` | `date_range` | `hash`; defaults to `auto` when omitted.
+- `requested_parallel_mode` = exactly what the client sent.
+- `resolved_parallel_mode` = the concrete mode the engine runs ∈ `numeric_range` | `date_range` | `hash` (never `auto`); may be reported as `single` for a single-worker run.
+- These map onto the engine's internal `partition_mode`: `numeric_range`→`numeric`, `date_range`→`date`, `hash`→`hash`.
+
+**Auto resolution rules** (from the selected partition/hash column's Oracle datatype):
+- `NUMBER` column → `numeric_range`.
+- `DATE` or `TIMESTAMP%` column → `date_range`.
+- Any other valid, selected column → `hash` (uses `ORA_HASH`).
+- No usable column with `auto` and `workers > 1` → clear validation error that a partition/hash column is required for parallel execution.
+
+**Explicit-mode validation rules** (return a clear `400` **before** launching — no job created on failure; datatype read from `all_tab_columns`, never trusted from the client):
+- `numeric_range` requires a `NUMBER` column.
+- `date_range` requires a `DATE` or `TIMESTAMP%` column.
+- `hash` requires a selected column (any supported partition-candidate type); uses `ORA_HASH(<column>)` and **may be used even for NUMBER or DATE columns** to override Auto when numeric/date range distribution is poor.
+- A mode that does not match the selected column's datatype (e.g. `date_range` on a `NUMBER` column) is rejected with a message naming the chosen mode, the column, and its datatype. An unknown `parallel_mode` value is rejected.
+
+**Worker-count rule** (`workers == 1`): single-thread behavior is allowed even when a parallel mode is selected — the backend runs the proven Phase 6 single-thread path (reporting `resolved_parallel_mode` as `single`) or clearly warns that the selected mode only takes effect when `workers > 1`. Never an error solely because a parallel mode was chosen with one worker. Worker count stays capped at 16.
+
+**Per-worker progress fields** (tracked per worker, returned in `/status`): `worker_id`, `partition_mode`, `resolved_parallel_mode`, `partition_column`, `range_start`, `range_end`, `status`, `processed_rows`, `inserted_rows`, `batches_completed`, `rows_per_second`, `error_message`.
 
 **Code that must exist after the phase**:
 - Target table is dropped and recreated **exactly once** per job (before workers fan out); workers only `INSERT` into that fresh target — never re-drop or re-create mid-job.
-- Mode selection: numeric range when numeric column chosen; date range when date/timestamp column chosen; hash mode fallback for non-null high-cardinality column.
-- Per-worker bounded SQL using bind variables; each worker batch-inserts and updates its own progress (the fields above), which aggregate into the overall job progress.
-- `GET /api/migrations/{job_id}/status` returns both the overall job progress (Phase 6 fields) **and** a `workers` array (one entry per worker with the per-worker fields above). See `contracts/migrations.md`.
-- The GUI shows one row/card per worker (worker_id, mode, column, range, status, processed/inserted rows, batches, rows/sec, error) in addition to the overall progress bar.
-- Worker count configurable, default 8, capped at 16; any worker failure → job FAILED (and that worker's `error_message` is surfaced).
+- `POST /api/migrations` accepts `parallel_mode` (omitting → `auto`); `resolve_parallel_mode(...)` applies the Auto rules + explicit-mode datatype validation using read-only Oracle metadata and returns the concrete resolved mode, free of FastAPI coupling.
+- Mode selection feeds the existing engine: numeric range when resolved to numeric; date range when resolved to date; hash otherwise.
+- Per-worker bounded SQL using bind variables; each worker batch-inserts and updates its own progress (the fields above), which aggregates into the overall job progress.
+- The job (and each worker entry) carries `requested_parallel_mode` and `resolved_parallel_mode`; `GET /api/migrations/{job_id}` and `GET /api/migrations/{job_id}/status` return both, plus the overall job progress (Phase 6 fields) and a `workers` array (per-worker fields above). See `contracts/migrations.md`.
+- The GUI shows the Parallel Mode dropdown with helper text, displays the resolved mode after launch, and shows one row/card per worker (worker_id, mode, column, range, status, processed/inserted rows, batches, rows/sec, error) in addition to the overall progress bar.
+- Worker count configurable, default 8, capped at 16; any worker failure → job FAILED (and that worker's `error_message` is surfaced). A single-worker launch with a parallel mode is allowed/warned, never a hard error.
 
-**Acceptance criteria**: numeric parallel works; date parallel works when date column exists; hash mode works as fallback; worker failures handled and surfaced per worker; total processed/inserted rows tracked and aggregated; the GUI renders per-worker progress cards plus the overall bar; `/status` returns the `workers` array; no duplicate/missing ranges for numeric/date; re-running the same table still yields latest-only counts (single drop+create per job, not per worker).
+**Acceptance criteria**: numeric parallel works; date parallel works when date column exists; hash mode works as fallback and as an explicit override for NUMBER/DATE columns; the Parallel Mode dropdown is visible near Partition/Hash Column and Worker Threads with per-mode helper text; `POST /api/migrations` accepts `parallel_mode` (default `auto`); Auto resolves by datatype (NUMBER→numeric_range, DATE/TIMESTAMP→date_range, else→hash); a mode conflicting with the column datatype (or `hash`/parallel `auto` with no usable column) returns a clear pre-launch `400` and creates no job; `requested_parallel_mode`/`resolved_parallel_mode` appear in `/status` and the GUI (overall + per-worker cards); `workers == 1` with a parallel mode is allowed/warned, never a hard error; worker failures handled and surfaced per worker; total processed/inserted rows tracked and aggregated; the GUI renders per-worker progress cards plus the overall bar; no duplicate/missing ranges for numeric/date; re-running the same table still yields latest-only counts (single drop+create per job, not per worker).
 
-**Constitution gate (P-V, P-I, P-II, P-VII)**: parallel mode is enabled only after single-thread (Phase 6) is proven; each worker still uses tuned `arraysize`/`prefetchrows` + chunked `fetchmany` + batch insert (no full-range load into memory, no `fetchall`, no row-by-row); per-worker `SELECT` bounds use bind variables; worker count is clamped to max 16; the only ClickHouse statements are one `DROP`/`CREATE` pair plus `INSERT`s, all in `oracle_migration_hazem`; row-count reconciliation (Phase 8) confirms no duplicate/missing rows.
+**Constitution gate (P-V, P-VI, P-I, P-II, P-VII)**: parallel mode is enabled only after single-thread (Phase 6) is proven; each worker still uses tuned `arraysize`/`prefetchrows` + chunked `fetchmany` + batch insert (no full-range load into memory, no `fetchall`, no row-by-row); per-worker `SELECT` bounds use bind variables; worker count is clamped to max 16; the datatype used to resolve/validate the Parallel Mode is read from live Oracle metadata (P-VI) — the client's claimed datatype is never trusted; mismatched mode/column combinations and unknown `parallel_mode` values are rejected with controlled errors and no dynamic SQL from raw input (P-VII); the only ClickHouse statements are one `DROP`/`CREATE` pair plus `INSERT`s, all in `oracle_migration_hazem`; row-count reconciliation (Phase 8) confirms no duplicate/missing rows.
 
 **Manual test commands**:
 ```bash
+# Numeric parallel run
 curl -X POST http://localhost:8000/api/migrations \
   -H 'Content-Type: application/json' \
-  -d '{"source_schema":"CM","source_table":"COMPONENT","target_table":"CM__COMPONENT","workers":8,"partition_column":"ID","partition_mode":"numeric"}'
-pytest tests/test_range_split.py
+  -d '{"source_schema":"CM","source_table":"COMPONENT","target_table":"CM__COMPONENT","workers":8,"partition_column":"ID","parallel_mode":"numeric_range"}'
+
+# Auto on a NUMBER column → resolves to numeric_range
+curl -s -X POST http://localhost:8000/api/migrations \
+  -H 'Content-Type: application/json' \
+  -d '{"source_schema":"CM","source_table":"COMPONENT","target_table":"CM__COMPONENT","workers":8,"partition_column":"ID","parallel_mode":"auto"}'
+
+# Explicit date_range on a NUMBER column → controlled 400, no job created
+curl -i -X POST http://localhost:8000/api/migrations \
+  -H 'Content-Type: application/json' \
+  -d '{"source_schema":"CM","source_table":"COMPONENT","target_table":"CM__COMPONENT","workers":8,"partition_column":"ID","parallel_mode":"date_range"}'
+
+# Hash without a selected column → controlled 400 (column required)
+curl -i -X POST http://localhost:8000/api/migrations \
+  -H 'Content-Type: application/json' \
+  -d '{"source_schema":"CM","source_table":"COMPONENT","target_table":"CM__COMPONENT","workers":8,"partition_column":null,"parallel_mode":"hash"}'
+
+# Status returns requested/resolved mode + per-worker resolved mode
+curl -s http://localhost:8000/api/migrations/$JOB/status
+pytest tests/test_range_split.py tests/test_parallel_mode.py
 ```
 
-**Stop point**: Stop after Phase 7 until parallel migration is tested on small and medium tables.
+**Stop point**: Stop after Phase 7 until parallel migration — including Parallel Mode selection, Auto resolution, datatype validation, requested/resolved display, and per-worker + overall progress — is tested on small and medium tables. Then continue Phase 8 (Validation, Counts, and Reconciliation).
 
 ---
 

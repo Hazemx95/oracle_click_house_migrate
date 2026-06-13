@@ -33,6 +33,7 @@ Columns eligible to drive parallelism / target ordering.
 - Same fields as OracleColumn (subset).
 - **Rule**: `data_type IN ('NUMBER','DATE') OR data_type LIKE 'TIMESTAMP%'`.
 - **Mode mapping**: NUMBER → numeric range; DATE/TIMESTAMP% → date range; any non-null high-cardinality column → hash fallback.
+- **Parallel-mode resolution (Phase 7)**: the column's `data_type` is the authoritative input for resolving/validating `parallel_mode`. `auto` resolves NUMBER→`numeric_range`, DATE/TIMESTAMP%→`date_range`, otherwise `hash`. An explicit `numeric_range` requires a NUMBER column, `date_range` requires a DATE/TIMESTAMP% column, and `hash` requires a selected column; a mismatch is a pre-launch validation error. Datatype is always read from Oracle metadata, never trusted from the client.
 
 ## TargetTable (ClickHouse, created)
 The destination table in `oracle_migration_hazem`.
@@ -51,7 +52,9 @@ A unit of background migration work.
 - `target_database` (string, = `oracle_migration_hazem`)
 - `target_table` (string)
 - `partition_column` (string, nullable)
-- `partition_mode` (enum: `single` | `numeric` | `date` | `hash`)
+- `partition_mode` (enum: `single` | `numeric` | `date` | `hash`) — internal engine path that drives Phase 7 extraction.
+- `requested_parallel_mode` (enum, Phase 7: `auto` | `numeric_range` | `date_range` | `hash`) — exactly what the client sent on `POST /api/migrations`; defaults to `auto` when omitted.
+- `resolved_parallel_mode` (enum, Phase 7: `numeric_range` | `date_range` | `hash`, or `single` for a single-worker run) — the concrete mode the engine runs after Auto resolution + datatype validation; never `auto`. Maps onto `partition_mode` (`numeric_range`→`numeric`, `date_range`→`date`, `hash`→`hash`).
 - `workers` (int, default 8, 1..16)
 - `status` (enum: `PENDING` | `RUNNING` | `SUCCESS` | `FAILED` | `CANCELLED`)
 - `total_rows` (int, nullable)
@@ -84,6 +87,7 @@ Validation runs after load completes (Phase 8); `validation_status` becomes `MAT
 A parallel extraction+load unit operating on one slice. Each entry is surfaced in `GET /api/migrations/{job_id}/status` under `workers` and rendered as a per-worker card/row in the GUI.
 - `worker_id` (int, 0..workers-1)
 - `partition_mode` (enum: `numeric` | `date` | `hash`)
+- `resolved_parallel_mode` (enum, Phase 7: `numeric_range` | `date_range` | `hash`) — the resolved user-facing mode, shown on each worker card/row in the GUI.
 - `partition_column` (string, nullable)
 - `range_start` / `range_end` — slice bounds: numeric `[start, end)` (final inclusive), date `[start, end)` (final inclusive), or null for hash bucket `MOD(ORA_HASH(col), workers) = worker_id`.
 - `status` (enum: `PENDING` | `RUNNING` | `SUCCESS` | `FAILED`)
