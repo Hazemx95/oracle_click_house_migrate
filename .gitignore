@@ -5,6 +5,7 @@
 !.env.example
 .agents
 .claude
+.CLUADE.md
 .specify
 # Python/local runtime artifacts
 oracle_click-house_venv/
@@ -25,3 +26,4 @@ Thumbs.db
 *.swp
 .vscode/
 .idea/
+.CLAUDE.md
