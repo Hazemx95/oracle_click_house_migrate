@@ -52,7 +52,7 @@ def launch_migration(request: MigrationRequest) -> dict[str, Any]:
     except ValueError as exc:
         raise _bad_request(str(exc)) from exc
     except Exception as exc:  # noqa: BLE001 - response must stay credential-free
-        logger.exception("Migration launch failed")
+        logger.error("Migration launch failed: %s", exc.__class__.__name__)
         raise HTTPException(
             status_code=503,
             detail={"status": "error", "error": "migration launch failed"},

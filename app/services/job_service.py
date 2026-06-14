@@ -4,7 +4,7 @@ from copy import deepcopy
 from datetime import UTC, datetime
 from enum import StrEnum
 from threading import RLock
-from time import time
+from time import perf_counter
 from uuid import uuid4
 
 from app.config import TARGET_DATABASE
@@ -44,6 +44,8 @@ PERFORMANCE_TIMING_KEYS = (
     "clickhouse_insert_duration_seconds",
     "validation_duration_seconds",
     "total_duration_seconds",
+    "oracle_connect_duration_seconds",
+    "clickhouse_connect_duration_seconds",
 )
 
 
@@ -55,10 +57,34 @@ def _new_performance_diagnostics(batch_size: int | None = None) -> dict[str, obj
             "batches_completed": 0,
             "average_rows_per_batch": 0.0,
             "average_seconds_per_batch": 0.0,
+            "timing_semantics": "wall_clock_seconds",
+            "per_worker_summary": {},
             "per_worker": [],
         }
     )
     return diagnostics
+
+
+def _worker_timing_summary(per_worker: list[object]) -> dict[str, dict[str, float]]:
+    timing_keys = (
+        "oracle_connect_duration_seconds",
+        "clickhouse_connect_duration_seconds",
+        "oracle_execute_duration_seconds",
+        "oracle_fetch_duration_seconds",
+        "row_conversion_duration_seconds",
+        "clickhouse_insert_duration_seconds",
+    )
+    worker_timings = [entry for entry in per_worker if isinstance(entry, dict)]
+    if not worker_timings:
+        return {}
+    summary: dict[str, dict[str, float]] = {}
+    for key in timing_keys:
+        values = [float(entry.get(key) or 0.0) for entry in worker_timings]
+        summary[key] = {
+            "max": round(max(values), 3),
+            "average": round(sum(values) / len(values), 3),
+        }
+    return summary
 
 
 def _utc_now_iso() -> str:
@@ -68,7 +94,7 @@ def _utc_now_iso() -> str:
 def _duration_seconds(started_at_ts: object, finished_at_ts: object | None = None) -> float:
     if not isinstance(started_at_ts, (int, float)):
         return 0.0
-    end = finished_at_ts if isinstance(finished_at_ts, (int, float)) else time()
+    end = finished_at_ts if isinstance(finished_at_ts, (int, float)) else perf_counter()
     return max(0.0, round(end - started_at_ts, 3))
 
 
@@ -120,6 +146,13 @@ def _apply_derived_progress(job: dict[str, object]) -> None:
         diagnostics["average_seconds_per_batch"] = (
             round(batch_seconds / batches_completed, 3) if batches_completed else 0.0
         )
+        per_worker = diagnostics.get("per_worker")
+        if isinstance(per_worker, list) and per_worker:
+            diagnostics["timing_semantics"] = "cumulative_worker_seconds"
+            diagnostics["per_worker_summary"] = _worker_timing_summary(per_worker)
+        else:
+            diagnostics["timing_semantics"] = "wall_clock_seconds"
+            diagnostics["per_worker_summary"] = {}
 
 
 def _public_job(job: dict[str, object]) -> dict[str, object]:
@@ -197,8 +230,7 @@ def get_job(job_id: str) -> dict[str, object] | None:
         job = _JOBS.get(job_id)
         if job is None:
             return None
-        if job.get("status") == JobStatus.RUNNING.value:
-            _apply_derived_progress(job)
+        _apply_derived_progress(job)
         return _public_job(job)
 
 
@@ -214,10 +246,10 @@ def update_job(job_id: str, **fields: object) -> dict[str, object]:
 
         if fields.get("status") == JobStatus.RUNNING.value and not job.get("started_at"):
             job["started_at"] = _utc_now_iso()
-            job["_started_at_ts"] = time()
+            job["_started_at_ts"] = perf_counter()
 
         if fields.get("status") in TERMINAL_STATUSES and not job.get("finished_at"):
-            finished_at_ts = time()
+            finished_at_ts = perf_counter()
             job["finished_at"] = _utc_now_iso()
             job["_finished_at_ts"] = finished_at_ts
             job["duration_seconds"] = _duration_seconds(job.get("_started_at_ts"), finished_at_ts)
@@ -236,7 +268,20 @@ def update_job(job_id: str, **fields: object) -> dict[str, object]:
         return _public_job(job)
 
 
-def add_warning(job_id: str, message: str) -> dict[str, object]:
+def update_job_progress(job_id: str, **fields: object) -> None:
+    with _LOCK:
+        job = _JOBS.get(job_id)
+        if job is None:
+            raise KeyError(f"job '{job_id}' not found")
+        job.update(fields)
+        if "current_batch_number" in fields and "current_batch" not in fields:
+            job["current_batch"] = fields["current_batch_number"]
+        if "current_batch" in fields and "current_batch_number" not in fields:
+            job["current_batch_number"] = fields["current_batch"]
+        _apply_derived_progress(job)
+
+
+def add_warning(job_id: str, message: str) -> None:
     with _LOCK:
         job = _JOBS.get(job_id)
         if job is None:
@@ -249,10 +294,9 @@ def add_warning(job_id: str, message: str) -> dict[str, object]:
             warnings.append(message)
         if not job.get("warning_message") and warnings:
             job["warning_message"] = warnings[0]
-        return _public_job(job)
 
 
-def add_diagnostic_timing(job_id: str, field: str, seconds: float) -> dict[str, object]:
+def add_diagnostic_timing(job_id: str, field: str, seconds: float) -> None:
     if field not in PERFORMANCE_TIMING_KEYS:
         raise ValueError(f"unknown diagnostic timing field '{field}'")
     with _LOCK:
@@ -264,11 +308,9 @@ def add_diagnostic_timing(job_id: str, field: str, seconds: float) -> dict[str, 
             diagnostics = _new_performance_diagnostics()
             job["performance_diagnostics"] = diagnostics
         diagnostics[field] = round(float(diagnostics.get(field) or 0.0) + seconds, 3)
-        _apply_derived_progress(job)
-        return _public_job(job)
 
 
-def update_performance_diagnostics(job_id: str, **fields: object) -> dict[str, object]:
+def update_performance_diagnostics(job_id: str, **fields: object) -> None:
     with _LOCK:
         job = _JOBS.get(job_id)
         if job is None:
@@ -278,11 +320,9 @@ def update_performance_diagnostics(job_id: str, **fields: object) -> dict[str, o
             diagnostics = _new_performance_diagnostics()
             job["performance_diagnostics"] = diagnostics
         diagnostics.update(fields)
-        _apply_derived_progress(job)
-        return _public_job(job)
 
 
-def set_worker_diagnostics(job_id: str, worker_id: int, timings: dict[str, object]) -> dict[str, object]:
+def set_worker_diagnostics(job_id: str, worker_id: int, timings: dict[str, object]) -> None:
     with _LOCK:
         job = _JOBS.get(job_id)
         if job is None:
@@ -303,21 +343,18 @@ def set_worker_diagnostics(job_id: str, worker_id: int, timings: dict[str, objec
                 break
         else:
             per_worker.append(public_timings)
-        _apply_derived_progress(job)
-        return _public_job(job)
 
 
-def set_workers(job_id: str, workers: list[dict[str, object]]) -> dict[str, object]:
+def set_workers(job_id: str, workers: list[dict[str, object]]) -> None:
     with _LOCK:
         job = _JOBS.get(job_id)
         if job is None:
             raise KeyError(f"job '{job_id}' not found")
         job["workers"] = deepcopy(workers)
         _apply_derived_progress(job)
-        return _public_job(job)
 
 
-def update_worker(job_id: str, worker_id: int, **fields: object) -> dict[str, object]:
+def update_worker(job_id: str, worker_id: int, **fields: object) -> None:
     with _LOCK:
         job = _JOBS.get(job_id)
         if job is None:
@@ -343,7 +380,7 @@ def update_worker(job_id: str, worker_id: int, **fields: object) -> dict[str, ob
             fields["status"] = status.value
 
         if fields.get("status") == JobStatus.RUNNING.value and not worker.get("_started_at_ts"):
-            worker["_started_at_ts"] = time()
+            worker["_started_at_ts"] = perf_counter()
 
         worker.update(fields)
         elapsed_seconds = _duration_seconds(worker.get("_started_at_ts"))
@@ -353,7 +390,6 @@ def update_worker(job_id: str, worker_id: int, **fields: object) -> dict[str, ob
             else 0.0
         )
         _apply_derived_progress(job)
-        return _public_job(job)
 
 
 def get_status(job_id: str) -> dict[str, object] | None:

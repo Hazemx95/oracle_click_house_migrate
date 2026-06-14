@@ -54,9 +54,13 @@ def test_create_job_initializes_phase_6_fields() -> None:
         "clickhouse_insert_duration_seconds",
         "validation_duration_seconds",
         "total_duration_seconds",
+        "oracle_connect_duration_seconds",
+        "clickhouse_connect_duration_seconds",
         "batches_completed",
         "average_rows_per_batch",
         "average_seconds_per_batch",
+        "timing_semantics",
+        "per_worker_summary",
         "per_worker",
     ):
         assert key in diagnostics
@@ -205,6 +209,23 @@ def test_warnings_are_appended_and_surface_in_status() -> None:
     ]
 
 
+def test_hot_path_diagnostic_update_does_not_snapshot_public_job(monkeypatch) -> None:
+    job_id = job_service.create_job(
+        source_schema="CM",
+        source_table="COMPONENT",
+        target_database=TARGET_DATABASE,
+        target_table="CM__COMPONENT",
+    )
+
+    def fail_snapshot(job):  # type: ignore[no-untyped-def]
+        raise AssertionError("hot path should not deepcopy public job")
+
+    monkeypatch.setattr(job_service, "_public_job", fail_snapshot)
+
+    job_service.add_diagnostic_timing(job_id, "oracle_fetch_duration_seconds", 0.25)
+    job_service.update_job_progress(job_id, processed_rows=1, inserted_rows=1)
+
+
 def test_worker_diagnostics_surface_in_status() -> None:
     job_id = job_service.create_job(
         source_schema="CM",
@@ -231,3 +252,8 @@ def test_worker_diagnostics_surface_in_status() -> None:
     per_worker = status["performance_diagnostics"]["per_worker"]
     assert per_worker[0]["worker_id"] == 0
     assert per_worker[0]["oracle_fetch_duration_seconds"] == 0.2
+    assert status["performance_diagnostics"]["timing_semantics"] == "cumulative_worker_seconds"
+    assert status["performance_diagnostics"]["per_worker_summary"]["oracle_fetch_duration_seconds"] == {
+        "max": 0.2,
+        "average": 0.2,
+    }

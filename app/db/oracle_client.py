@@ -23,6 +23,11 @@ def _safe_error_message(exc: Exception, settings: Settings) -> str:
     return message
 
 
+def configure_oracle_defaults() -> None:
+    if oracledb is not None and hasattr(oracledb, "defaults"):
+        oracledb.defaults.fetch_lobs = False
+
+
 def _assert_select_only(sql: str) -> None:
     stripped = sql.strip()
     while True:
@@ -107,6 +112,7 @@ def build_dsn(settings: Settings) -> str:
 def get_connection(settings: Settings | None = None) -> Any:
     if oracledb is None:
         raise RuntimeError("Oracle driver is not installed")
+    configure_oracle_defaults()
     settings = settings or get_settings()
     connection = oracledb.connect(
         user=settings.p5_qa_oracle_user,

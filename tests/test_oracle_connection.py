@@ -100,3 +100,17 @@ def test_oracle_health_redacts_password(monkeypatch: pytest.MonkeyPatch) -> None
     assert result["status"] == "error"
     assert "super-secret" not in str(result["error"])
     assert "***" in str(result["error"])
+
+
+def test_oracle_defaults_disable_lob_locator_fetching(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeDefaults:
+        fetch_lobs = True
+
+    class FakeOracleModule:
+        defaults = FakeDefaults()
+
+    monkeypatch.setattr(oracle_client, "oracledb", FakeOracleModule())
+
+    oracle_client.configure_oracle_defaults()
+
+    assert FakeOracleModule.defaults.fetch_lobs is False

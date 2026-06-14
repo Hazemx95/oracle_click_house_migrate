@@ -167,6 +167,9 @@
 
           <section class="diagnostics-panel" aria-label="Performance diagnostics">
             <h3>Performance Diagnostics</h3>
+            <p class="field-help" id="diagnostics-semantics">
+              Timing fields are wall-clock seconds for the single load path.
+            </p>
             <dl class="metrics-grid">
               <div>
                 <dt>Total Duration</dt>
@@ -181,6 +184,10 @@
                 <dd id="diag-oracle-execute">0s</dd>
               </div>
               <div>
+                <dt>Oracle Connect Time</dt>
+                <dd id="diag-oracle-connect">0s</dd>
+              </div>
+              <div>
                 <dt>Oracle Fetch Time</dt>
                 <dd id="diag-oracle-fetch">0s</dd>
               </div>
@@ -191,6 +198,10 @@
               <div>
                 <dt>ClickHouse Insert Time</dt>
                 <dd id="diag-clickhouse-insert">0s</dd>
+              </div>
+              <div>
+                <dt>ClickHouse Connect Time</dt>
+                <dd id="diag-clickhouse-connect">0s</dd>
               </div>
               <div>
                 <dt>Validation Time</dt>
@@ -207,6 +218,18 @@
               <div>
                 <dt>Average Seconds / Batch</dt>
                 <dd id="diag-average-seconds">0s</dd>
+              </div>
+              <div>
+                <dt>Max Worker Fetch</dt>
+                <dd id="diag-max-worker-fetch">0s</dd>
+              </div>
+              <div>
+                <dt>Max Worker Convert</dt>
+                <dd id="diag-max-worker-convert">0s</dd>
+              </div>
+              <div>
+                <dt>Max Worker Insert</dt>
+                <dd id="diag-max-worker-insert">0s</dd>
               </div>
             </dl>
             <div class="warnings-panel">

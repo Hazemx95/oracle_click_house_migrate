@@ -28,16 +28,22 @@ const elements = {
   requestedParallelMode: document.querySelector("#requested-parallel-mode"),
   resolvedParallelMode: document.querySelector("#resolved-parallel-mode"),
   migrationError: document.querySelector("#migration-error"),
+  diagnosticsSemantics: document.querySelector("#diagnostics-semantics"),
   diagTotalDuration: document.querySelector("#diag-total-duration"),
   diagOracleCount: document.querySelector("#diag-oracle-count"),
+  diagOracleConnect: document.querySelector("#diag-oracle-connect"),
   diagOracleExecute: document.querySelector("#diag-oracle-execute"),
   diagOracleFetch: document.querySelector("#diag-oracle-fetch"),
   diagRowConversion: document.querySelector("#diag-row-conversion"),
+  diagClickhouseConnect: document.querySelector("#diag-clickhouse-connect"),
   diagClickhouseInsert: document.querySelector("#diag-clickhouse-insert"),
   diagValidation: document.querySelector("#diag-validation"),
   diagBatchSize: document.querySelector("#diag-batch-size"),
   diagAverageRows: document.querySelector("#diag-average-rows"),
   diagAverageSeconds: document.querySelector("#diag-average-seconds"),
+  diagMaxWorkerFetch: document.querySelector("#diag-max-worker-fetch"),
+  diagMaxWorkerConvert: document.querySelector("#diag-max-worker-convert"),
+  diagMaxWorkerInsert: document.querySelector("#diag-max-worker-insert"),
   diagnosticsWarnings: document.querySelector("#diagnostics-warnings"),
   validationSummary: document.querySelector("#validation-summary"),
   sourceRowCount: document.querySelector("#source-row-count"),
@@ -271,16 +277,27 @@ function renderWorkers(workers) {
 
 function renderDiagnostics(status) {
   const diagnostics = status.performance_diagnostics || {};
+  const workerSummary = diagnostics.per_worker_summary || {};
+  if (diagnostics.timing_semantics === "cumulative_worker_seconds") {
+    elements.diagnosticsSemantics.textContent = "Parallel aggregate timing fields are cumulative worker-seconds; max worker timings show the wall-clock bottleneck.";
+  } else {
+    elements.diagnosticsSemantics.textContent = "Timing fields are wall-clock seconds for the single load path.";
+  }
   elements.diagTotalDuration.textContent = formatSeconds(diagnostics.total_duration_seconds);
   elements.diagOracleCount.textContent = formatSeconds(diagnostics.oracle_count_duration_seconds);
+  elements.diagOracleConnect.textContent = formatSeconds(diagnostics.oracle_connect_duration_seconds);
   elements.diagOracleExecute.textContent = formatSeconds(diagnostics.oracle_execute_duration_seconds);
   elements.diagOracleFetch.textContent = formatSeconds(diagnostics.oracle_fetch_duration_seconds);
   elements.diagRowConversion.textContent = formatSeconds(diagnostics.row_conversion_duration_seconds);
+  elements.diagClickhouseConnect.textContent = formatSeconds(diagnostics.clickhouse_connect_duration_seconds);
   elements.diagClickhouseInsert.textContent = formatSeconds(diagnostics.clickhouse_insert_duration_seconds);
   elements.diagValidation.textContent = formatSeconds(diagnostics.validation_duration_seconds);
   elements.diagBatchSize.textContent = formatNumber(diagnostics.batch_size);
   elements.diagAverageRows.textContent = formatNumber(diagnostics.average_rows_per_batch);
   elements.diagAverageSeconds.textContent = formatSeconds(diagnostics.average_seconds_per_batch);
+  elements.diagMaxWorkerFetch.textContent = formatSeconds(workerSummary.oracle_fetch_duration_seconds?.max);
+  elements.diagMaxWorkerConvert.textContent = formatSeconds(workerSummary.row_conversion_duration_seconds?.max);
+  elements.diagMaxWorkerInsert.textContent = formatSeconds(workerSummary.clickhouse_insert_duration_seconds?.max);
 
   const warnings = Array.isArray(status.warnings) ? status.warnings : [];
   elements.diagnosticsWarnings.replaceChildren();

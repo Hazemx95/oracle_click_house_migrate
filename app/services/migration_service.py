@@ -64,6 +64,18 @@ def _record_timing(job_id: str, field: str, started_at: float) -> None:
     job_service.add_diagnostic_timing(job_id, field, perf_counter() - started_at)
 
 
+def _copy_phase_seconds(timings: dict[str, float]) -> float:
+    return sum(
+        float(timings.get(key) or 0.0)
+        for key in (
+            "oracle_execute_duration_seconds",
+            "oracle_fetch_duration_seconds",
+            "row_conversion_duration_seconds",
+            "clickhouse_insert_duration_seconds",
+        )
+    )
+
+
 def _chunk_rows(rows: list[Any], chunk_size: int) -> Iterator[list[Any]]:
     for index in range(0, len(rows), chunk_size):
         yield rows[index : index + chunk_size]
@@ -750,6 +762,8 @@ def _copy_batches(
     batches_completed = 0
     step = "oracle_connect"
     worker_timings = {
+        "oracle_connect_duration_seconds": 0.0,
+        "clickhouse_connect_duration_seconds": 0.0,
         "oracle_execute_duration_seconds": 0.0,
         "oracle_fetch_duration_seconds": 0.0,
         "row_conversion_duration_seconds": 0.0,
@@ -758,8 +772,31 @@ def _copy_batches(
         "average_seconds_per_batch": 0.0,
     }
     try:
-        clickhouse = clickhouse_client.get_client()
-        with oracle_client.get_connection() as connection:
+        step = "clickhouse_connect"
+        started_at = perf_counter()
+        try:
+            clickhouse = clickhouse_client.get_client()
+        finally:
+            elapsed = perf_counter() - started_at
+            worker_timings["clickhouse_connect_duration_seconds"] += elapsed
+            job_service.add_diagnostic_timing(
+                job_id,
+                "clickhouse_connect_duration_seconds",
+                elapsed,
+            )
+        step = "oracle_connect"
+        started_at = perf_counter()
+        try:
+            oracle_connection = oracle_client.get_connection()
+        finally:
+            elapsed = perf_counter() - started_at
+            worker_timings["oracle_connect_duration_seconds"] += elapsed
+            job_service.add_diagnostic_timing(
+                job_id,
+                "oracle_connect_duration_seconds",
+                elapsed,
+            )
+        with oracle_connection as connection:
             with connection.cursor() as cursor:
                 cursor.arraysize = settings.oracle_arraysize
                 cursor.prefetchrows = settings.oracle_prefetchrows
@@ -824,22 +861,14 @@ def _copy_batches(
                     inserted_rows += inserted
                     batches_completed += 1
                     worker_timings["batches_completed"] = batches_completed
-                    copy_seconds = sum(
-                        float(worker_timings[key])
-                        for key in (
-                            "oracle_execute_duration_seconds",
-                            "oracle_fetch_duration_seconds",
-                            "row_conversion_duration_seconds",
-                            "clickhouse_insert_duration_seconds",
-                        )
-                    )
+                    copy_seconds = _copy_phase_seconds(worker_timings)
                     worker_timings["average_seconds_per_batch"] = (
                         round(copy_seconds / batches_completed, 3)
                         if batches_completed
                         else 0.0
                     )
                     if worker_id is None:
-                        job_service.update_job(
+                        job_service.update_job_progress(
                             job_id,
                             processed_rows=processed_rows,
                             inserted_rows=inserted_rows,
@@ -991,6 +1020,8 @@ def run_parallel(
     if not ranges:
         job_service.set_workers(job_id, [])
         return
+    if len(ranges) != request.workers:
+        job_service.update_job(job_id, worker_count=len(ranges))
 
     workers = [
         _worker_base(

@@ -111,6 +111,14 @@ def test_binary_and_lob_values_are_normalized_to_hex_strings() -> None:
     assert batch == [("0102", "0304", "0506", "ff00")]
 
 
+def test_inline_lob_values_do_not_require_locator_reads() -> None:
+    batch = migration_service._normalize_batch(  # noqa: SLF001 - verifies fetch_lobs=False path
+        [("clob text", b"\x01\x02")]
+    )
+
+    assert batch == [("clob text", "0102")]
+
+
 def test_clickhouse_insert_rows_uses_batch_insert_with_explicit_columns() -> None:
     class FakeClickHouse:
         def __init__(self) -> None:
@@ -275,6 +283,28 @@ def test_run_validation_keeps_source_count_when_target_count_fails(monkeypatch) 
     assert job["validation_error_message"] == "validation: target count unavailable"
 
 
+def test_run_validation_records_duration_when_count_fails(monkeypatch) -> None:
+    job_id = job_service.create_job(
+        source_schema="CM",
+        source_table="COMPONENT",
+        target_database=TARGET_DATABASE,
+        target_table="CM__COMPONENT",
+    )
+    ticks = iter([100.0, 102.5])
+    monkeypatch.setattr(migration_service, "perf_counter", lambda: next(ticks))
+
+    def raise_source_error(schema, table):  # type: ignore[no-untyped-def]
+        raise RuntimeError("source count unavailable")
+
+    monkeypatch.setattr(migration_service, "count_source", raise_source_error)
+
+    migration_service.run_validation(job_id)
+    job = job_service.get_job(job_id)
+
+    assert job is not None
+    assert job["performance_diagnostics"]["validation_duration_seconds"] == 2.5
+
+
 def test_hash_worker_uses_null_safe_hash_predicate(monkeypatch) -> None:
     captured = {}
     job_id = job_service.create_job(
@@ -393,6 +423,50 @@ def test_run_parallel_aggregates_worker_progress(monkeypatch) -> None:
     assert status["inserted_rows"] == 100
     assert status["batches_completed"] == 2
     assert status["progress_percent"] == 100.0
+
+
+def test_run_parallel_reports_actual_range_count_when_fewer_than_requested(monkeypatch) -> None:
+    job_id = job_service.create_job(
+        source_schema="CM",
+        source_table="COMPONENT",
+        target_database=TARGET_DATABASE,
+        target_table="CM__COMPONENT",
+        partition_column="ID",
+        partition_mode="numeric",
+        worker_count=8,
+        requested_parallel_mode="numeric_range",
+        resolved_parallel_mode="numeric_range",
+    )
+    request = migration_service.InitialLoadRequest(
+        source_schema="CM",
+        source_table="COMPONENT",
+        target_schema="CM",
+        target_table="COMPONENT",
+        partition_column="ID",
+        workers=8,
+        batch_size=100,
+        requested_parallel_mode="numeric_range",
+        resolved_parallel_mode="numeric_range",
+        partition_mode="numeric",
+    )
+    monkeypatch.setattr(
+        migration_service,
+        "_build_worker_ranges",
+        lambda request: [
+            migration_service.PartitionRange(0, 1, 2, False, True),
+            migration_service.PartitionRange(1, 2, 3, False, False),
+            migration_service.PartitionRange(2, 3, 3, True, False),
+        ],
+    )
+    monkeypatch.setattr(migration_service, "_run_worker", lambda *args: None)
+
+    migration_service.run_parallel(job_id, request, "CM__COMPONENT", ["ID"])
+    status = job_service.get_status(job_id)
+
+    assert status is not None
+    assert status["requested_workers"] == 8
+    assert status["worker_count"] == 3
+    assert len(status["workers"]) == 3
 
 
 def test_small_table_auto_mode_downgrades_to_single_with_warning(monkeypatch) -> None:
