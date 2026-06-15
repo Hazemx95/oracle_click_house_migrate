@@ -1,4 +1,6 @@
+import inspect
 import re
+import socket
 from typing import Any
 
 from app.config import TARGET_DATABASE, Settings, get_settings
@@ -25,6 +27,10 @@ _CREATE_DDL_RE = re.compile(
 _SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$#]*$")
 
 
+class ClickHouseInsertTimeoutError(RuntimeError):
+    """Raised when an insert may have reached ClickHouse but timed out client-side."""
+
+
 def _safe_error_message(exc: Exception, settings: Settings) -> str:
     message = str(exc) or exc.__class__.__name__
     if settings.clickhouse_pass:
@@ -32,16 +38,67 @@ def _safe_error_message(exc: Exception, settings: Settings) -> str:
     return message
 
 
+def _call_supports_kwarg(func: Any, kwarg: str) -> bool:
+    try:
+        signature = inspect.signature(func)
+    except (TypeError, ValueError):
+        return True
+    return kwarg in signature.parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+
+
+def _capability_guarded_kwargs(func: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in kwargs.items() if _call_supports_kwarg(func, key)}
+
+
+def is_transient_connection_error(exc: Exception) -> bool:
+    if isinstance(exc, (TimeoutError, socket.timeout, ClickHouseInsertTimeoutError)):
+        return True
+    message = str(exc).lower()
+    transient_markers = (
+        "connection aborted",
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "connection reset",
+        "remote end closed connection",
+    )
+    return any(marker in message for marker in transient_markers)
+
+
+def _is_timeout_error(exc: Exception) -> bool:
+    if isinstance(exc, (TimeoutError, socket.timeout, ClickHouseInsertTimeoutError)):
+        return True
+    message = str(exc).lower()
+    return "timeout" in message or "timed out" in message or "connection aborted" in message
+
+
 def get_client(settings: Settings | None = None) -> Any:
     if clickhouse_connect is None:
         raise RuntimeError("ClickHouse driver is not installed")
     settings = settings or get_settings()
-    return clickhouse_connect.get_client(
-        host=settings.clickhouse_host,
-        port=settings.clickhouse_port,
-        username=settings.clickhouse_user,
-        password=settings.clickhouse_pass,
-    )
+    kwargs = {
+        "host": settings.clickhouse_host,
+        "port": settings.clickhouse_port,
+        "username": settings.clickhouse_user,
+        "password": settings.clickhouse_pass,
+        "connect_timeout": settings.clickhouse_connect_timeout_seconds,
+        "send_receive_timeout": settings.clickhouse_send_receive_timeout_seconds,
+        "compress": settings.clickhouse_compress,
+    }
+    guarded_kwargs = _capability_guarded_kwargs(clickhouse_connect.get_client, kwargs)
+    try:
+        return clickhouse_connect.get_client(**guarded_kwargs)
+    except TypeError:
+        minimal_kwargs = {
+            "host": settings.clickhouse_host,
+            "port": settings.clickhouse_port,
+            "username": settings.clickhouse_user,
+            "password": settings.clickhouse_pass,
+        }
+        return clickhouse_connect.get_client(**minimal_kwargs)
 
 
 def _rows(query_result: Any) -> list[Any]:
@@ -141,6 +198,7 @@ def insert_rows(
     target_database: str = TARGET_DATABASE,
     client: Any | None = None,
 ) -> int:
+    settings = get_settings()
     if target_database != TARGET_DATABASE:
         raise ValueError(f"target database must be '{TARGET_DATABASE}'")
     _assert_safe_identifier(table, "table")
@@ -153,14 +211,19 @@ def insert_rows(
     close_client = client is None
     client = client or get_client()
     try:
+        insert_kwargs = {
+            "table": table,
+            "data": list(rows),
+            "column_names": column_names,
+            "database": target_database,
+        }
         # One client.insert call per chunk keeps this path batch-oriented, never row-by-row.
-        client.insert(
-            table=table,
-            data=list(rows),
-            column_names=column_names,
-            database=target_database,
-        )
+        client.insert(**insert_kwargs)
         return len(rows)
+    except Exception as exc:  # noqa: BLE001 - caller needs typed timeout failures
+        if _is_timeout_error(exc):
+            raise ClickHouseInsertTimeoutError(_safe_error_message(exc, settings)) from exc
+        raise
     finally:
         if close_client and hasattr(client, "close"):
             client.close()

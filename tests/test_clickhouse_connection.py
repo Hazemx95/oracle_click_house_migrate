@@ -96,7 +96,7 @@ def test_clickhouse_health_redacts_password(monkeypatch: pytest.MonkeyPatch) -> 
     assert "***" in str(result["error"])
 
 
-def test_insert_rows_uses_single_batch_insert_call_for_multi_row_batch() -> None:
+def test_insert_rows_uses_single_batch_insert_call_for_multi_row_batch(monkeypatch: pytest.MonkeyPatch) -> None:
     class InsertCapturingClient:
         def __init__(self) -> None:
             self.calls = []
@@ -105,6 +105,7 @@ def test_insert_rows_uses_single_batch_insert_call_for_multi_row_batch() -> None
             self.calls.append(kwargs)
 
     client = InsertCapturingClient()
+    monkeypatch.setattr(clickhouse_client, "get_settings", lambda: Settings())
 
     inserted = clickhouse_client.insert_rows(
         "CM__COMPONENT",
@@ -121,3 +122,46 @@ def test_insert_rows_uses_single_batch_insert_call_for_multi_row_batch() -> None
         "column_names": ["ID", "NAME"],
         "database": TARGET_DATABASE,
     }
+
+
+def test_get_client_receives_timeout_and_compression_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = {}
+
+    class FakeClickhouseConnect:
+        @staticmethod
+        def get_client(**kwargs):  # type: ignore[no-untyped-def]
+            captured.update(kwargs)
+            return object()
+
+    settings = Settings(
+        clickhouse_host="clickhouse.local",
+        clickhouse_port=8123,
+        clickhouse_user="user",
+        clickhouse_pass="",
+        clickhouse_connect_timeout_seconds=15,
+        clickhouse_send_receive_timeout_seconds=900,
+        clickhouse_compress=True,
+    )
+    monkeypatch.setattr(clickhouse_client, "clickhouse_connect", FakeClickhouseConnect)
+
+    clickhouse_client.get_client(settings)
+
+    assert captured["connect_timeout"] == 15
+    assert captured["send_receive_timeout"] == 900
+    assert captured["compress"] is True
+
+
+def test_insert_timeout_is_raised_as_safe_typed_error() -> None:
+    class TimeoutClient:
+        def insert(self, **kwargs):  # type: ignore[no-untyped-def]
+            raise TimeoutError("timed out")
+
+    with pytest.raises(clickhouse_client.ClickHouseInsertTimeoutError, match="timed out"):
+        clickhouse_client.insert_rows("CM__COMPONENT", [(1,)], ["ID"], client=TimeoutClient())
+
+
+def test_clickhouse_helpers_reject_non_target_database() -> None:
+    with pytest.raises(ValueError, match="target database must be 'oracle_migration_hazem'"):
+        clickhouse_client.insert_rows("CM__COMPONENT", [(1,)], ["ID"], target_database="default")
+    with pytest.raises(ValueError, match="target database must be 'oracle_migration_hazem'"):
+        clickhouse_client.count_rows("CM__COMPONENT", target_database="default")

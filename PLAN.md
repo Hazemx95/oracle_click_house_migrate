@@ -123,13 +123,24 @@ P5_QA_ORACLE_DSN=
 APP_HOST=0.0.0.0
 APP_PORT=8000
 MIGRATION_BATCH_SIZE=100000
-MIGRATION_DEFAULT_WORKERS=8
+MIGRATION_DEFAULT_WORKERS=4
 
 # Phase 8.1 performance tuning (each defaults to MIGRATION_BATCH_SIZE when unset)
 ORACLE_ARRAYSIZE=100000
 ORACLE_PREFETCHROWS=100000
-CLICKHOUSE_INSERT_BATCH_SIZE=100000
 MIGRATION_PARALLEL_MIN_ROWS=100000
+
+# Phase 8.2 ClickHouse insert timeout, backpressure, worker tuning, and validation
+CLICKHOUSE_CONNECT_TIMEOUT_SECONDS=15
+CLICKHOUSE_SEND_RECEIVE_TIMEOUT_SECONDS=900
+CLICKHOUSE_INSERT_TIMEOUT_SECONDS=900
+CLICKHOUSE_COMPRESS=true
+CLICKHOUSE_MAX_CONCURRENT_INSERTS=2
+CLICKHOUSE_INSERT_BATCH_SIZE=25000
+CLICKHOUSE_INSERT_RETRY_ATTEMPTS=0
+MIGRATION_MAX_WORKERS=8
+VALIDATION_MODE=fast
+VALIDATION_TIMEOUT_SECONDS=600
 ```
 
 ### 4.2 `.env.example`
@@ -151,13 +162,24 @@ P5_QA_ORACLE_DSN=p5-ora-quality.cdyue4j7h7u5.us-east-1.rds.amazonaws.com:1521/qu
 APP_HOST=0.0.0.0
 APP_PORT=8000
 MIGRATION_BATCH_SIZE=100000
-MIGRATION_DEFAULT_WORKERS=8
+MIGRATION_DEFAULT_WORKERS=4
 
 # Phase 8.1 performance tuning (each defaults to MIGRATION_BATCH_SIZE when unset)
 ORACLE_ARRAYSIZE=100000
 ORACLE_PREFETCHROWS=100000
-CLICKHOUSE_INSERT_BATCH_SIZE=100000
 MIGRATION_PARALLEL_MIN_ROWS=100000
+
+# Phase 8.2 ClickHouse insert timeout, backpressure, worker tuning, and validation
+CLICKHOUSE_CONNECT_TIMEOUT_SECONDS=15
+CLICKHOUSE_SEND_RECEIVE_TIMEOUT_SECONDS=900
+CLICKHOUSE_INSERT_TIMEOUT_SECONDS=900
+CLICKHOUSE_COMPRESS=true
+CLICKHOUSE_MAX_CONCURRENT_INSERTS=2
+CLICKHOUSE_INSERT_BATCH_SIZE=25000
+CLICKHOUSE_INSERT_RETRY_ATTEMPTS=0
+MIGRATION_MAX_WORKERS=8
+VALIDATION_MODE=fast
+VALIDATION_TIMEOUT_SECONDS=600
 ```
 
 ### 4.3 `.gitignore`
@@ -1535,7 +1557,135 @@ Add diagnostics to: `app/services/job_service.py`; `app/services/migration_servi
 
 ## Stop Point
 
-Stop after Phase 8.1 once the timing breakdown localizes the slow step (API + GUI + logs), the bounded optimizations are in place, and migration + validation still pass. Then continue Phase 9.
+Stop after Phase 8.1 once the timing breakdown localizes the slow step (API + GUI + logs), the bounded optimizations are in place, and migration + validation still pass. Then continue Phase 8.2.
+
+---
+
+# 16.2 Phase 8.2 — ClickHouse Insert Timeout, Backpressure, and Validation Optimization
+
+## Goal
+
+Prevent ClickHouse HTTP insert timeout failures during huge table migration by adding safe timeout configuration, insert backpressure, worker tuning, safer failure handling, and faster validation options.
+
+Observed failure to eliminate:
+
+```text
+clickhouse_insert: Error ('Connection aborted.', TimeoutError('timed out')) executing HTTP request attempt 1 (http://<host>:8123)
+```
+
+A worker sent an HTTP insert and did not receive a response before the timeout expired. The batch may or may not have reached ClickHouse, so **blindly retrying is unsafe**. The safe recovery strategy is a full job restart, because this project already drops and recreates the target table at the start of each migration.
+
+Do not rewrite the whole project. Do not change business behavior.
+
+## Keep Business Behavior
+
+Initial full load only. Drop target ClickHouse table once per job. Create target ClickHouse table once per job. Full-load Oracle rows. Validate Oracle count vs ClickHouse count. No CDC. No incremental. No watermark. No staging table. No append duplicates. Oracle read-only. ClickHouse writes only to `oracle_migration_hazem`. Service layer reusable from Flask. FastAPI routes as thin wrappers.
+
+## ClickHouse Timeout Configuration
+
+The ClickHouse client must read these from environment/config (never hardcode timeouts inside service logic; never log credentials):
+
+* `CLICKHOUSE_CONNECT_TIMEOUT_SECONDS` default `15`.
+* `CLICKHOUSE_SEND_RECEIVE_TIMEOUT_SECONDS` default `900`.
+* `CLICKHOUSE_INSERT_TIMEOUT_SECONDS` default `900` (applied if the current client implementation supports it).
+* `CLICKHOUSE_COMPRESS` default `true` (applied if supported by the current `clickhouse-connect` version).
+
+## ClickHouse Insert Backpressure
+
+* `CLICKHOUSE_MAX_CONCURRENT_INSERTS` default `2`.
+* Use a semaphore or bounded insert queue so that many Oracle workers do not all insert into ClickHouse at the same time.
+* Oracle worker count and ClickHouse insert concurrency must be **separate** (example: `workers=8` but max concurrent ClickHouse inserts `=2`).
+* This prevents ClickHouse HTTP overload and timeout.
+
+## Safer Batch Configuration
+
+* `CLICKHOUSE_INSERT_BATCH_SIZE` default `25000` for large/heavy rows.
+* Keep `MIGRATION_BATCH_SIZE` for the Oracle fetch.
+* Allow ClickHouse insert chunking smaller than the Oracle fetch batch; a fetched Oracle batch may be split into smaller ClickHouse insert batches.
+* Track both the Oracle fetch batch size and the ClickHouse insert batch size in diagnostics.
+
+## Worker Tuning
+
+* `MIGRATION_DEFAULT_WORKERS` default `4`.
+* `MIGRATION_MAX_WORKERS` default `8` for the current environment.
+* Keep the hard safety cap `16` only if explicitly configured.
+* Warn when a user requests workers above the safe default.
+* Show a recommended worker count in the GUI based on table size, with warnings.
+* Do not automatically increase workers to solve timeouts.
+
+## Failure Handling
+
+If a ClickHouse insert times out:
+
+* Mark the worker `FAILED`.
+* Mark the whole job `FAILED`.
+* Signal other workers to stop at the next safe batch boundary.
+* Do not continue validation after an insert timeout.
+* Treat the target table as incomplete.
+* Show this exact GUI error: `"ClickHouse insert timed out. Target table may be incomplete. Re-run migration after reducing batch size or worker concurrency."`
+* Store: failed worker ID, batch number, range_start, range_end, inserted rows before failure, exception class, and a safe exception message.
+
+## Retry Policy
+
+* Do not blindly retry a ClickHouse insert timeout by default (the insert may have reached ClickHouse while the response timed out).
+* `CLICKHOUSE_INSERT_RETRY_ATTEMPTS` default `0`.
+* Allow retries only when explicitly enabled.
+* If enabled, retry only transient connection errors and log a warning that the duplicate-insert risk must be understood.
+* Full job restart remains the safe recovery strategy.
+
+## Validation Optimization
+
+* `VALIDATION_MODE` allowed values: `fast`, `strict`, `none`. Default `fast`.
+* `fast`: use the Oracle source count captured at migration start; after load, run only ClickHouse target `COUNT(*)`; compare initial Oracle source count vs ClickHouse target count.
+* `strict`: re-run Oracle `COUNT(*)` after load and run ClickHouse `COUNT(*)`; compare both post-load counts.
+* `none`: skip validation but show `validation_status=SKIPPED` (use only when explicitly configured).
+* The GUI must show which validation mode was used.
+
+## Validation Timeout
+
+* `VALIDATION_TIMEOUT_SECONDS` default `600`.
+* If validation exceeds the timeout, mark `validation_status=FAILED` or `TIMEOUT` with a clear message, but do not hide the successful insert status.
+* Do not modify Oracle or ClickHouse during validation.
+
+## Diagnostics
+
+Add and return from `GET /api/migrations/{job_id}/status` (and show in the GUI Performance Diagnostics):
+
+* `clickhouse_insert_timeout_count`
+* `clickhouse_insert_retries`
+* `clickhouse_insert_batch_size`
+* `max_concurrent_clickhouse_inserts`
+* `clickhouse_insert_error_count`
+* `validation_mode`
+* `validation_timeout_seconds`
+* insert concurrency wait time (when using a semaphore)
+
+## Tests
+
+* Config parses the timeout values.
+* Config parses `CLICKHOUSE_MAX_CONCURRENT_INSERTS`.
+* The ClickHouse client receives the configured timeout values.
+* The insert semaphore limits concurrent ClickHouse inserts.
+* An insert timeout marks the worker and job `FAILED`.
+* `fast` validation reuses the initial Oracle count.
+* `strict` validation re-runs the Oracle count.
+* `none` validation skips counting and marks `SKIPPED`.
+* Service modules do not import FastAPI.
+
+## Acceptance Criteria
+
+* All new settings are env-driven and parsed (invalid `VALIDATION_MODE` rejected).
+* The ClickHouse client uses the configured connect/send-receive/compress (and insert timeout where supported).
+* The insert semaphore bounds concurrent inserts while Oracle worker concurrency stays independent.
+* Insert timeout fails the worker and job, stops other workers safely, skips validation, and shows the exact GUI message with a stored failure record.
+* Retries are off by default; opt-in retry covers only transient connection errors and warns about duplicate risk.
+* `fast`/`strict`/`none` validation behave as specified within `VALIDATION_TIMEOUT_SECONDS`.
+* All new diagnostics appear in the status API and GUI; the validation mode and a recommended worker count are shown.
+* Service modules stay framework-agnostic; routes stay thin wrappers.
+
+## Stop Point
+
+Stop after Phase 8.2. Do not continue until timeouts are configurable, the insert semaphore bounds concurrency, insert timeout fails the job fast with no validation and a clear message, retries are off by default, the three validation modes work within their timeout, and the new diagnostics appear in the status API and GUI. Then continue Phase 9.
 
 ---
 

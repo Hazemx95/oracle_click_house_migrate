@@ -23,6 +23,8 @@ class ValidationStatus(StrEnum):
     RUNNING = "RUNNING"
     SUCCESS = "SUCCESS"
     FAILED = "FAILED"
+    SKIPPED = "SKIPPED"
+    TIMEOUT = "TIMEOUT"
 
 
 TERMINAL_STATUSES = {
@@ -54,6 +56,19 @@ def _new_performance_diagnostics(batch_size: int | None = None) -> dict[str, obj
     diagnostics.update(
         {
             "batch_size": batch_size or 0,
+            "oracle_fetch_batch_size": batch_size or 0,
+            "clickhouse_insert_batch_size": 0,
+            "max_concurrent_clickhouse_inserts": 0,
+            "insert_wait_seconds": 0.0,
+            "insert_chunk_count": 0,
+            "rows_per_insert_chunk": [],
+            "insert_chunk_duration_seconds": [],
+            "clickhouse_insert_timeout_count": 0,
+            "clickhouse_insert_retries": 0,
+            "clickhouse_insert_error_count": 0,
+            "validation_mode": "fast",
+            "validation_timeout_seconds": 0,
+            "insert_failure": None,
             "batches_completed": 0,
             "average_rows_per_batch": 0.0,
             "average_seconds_per_batch": 0.0,
@@ -154,6 +169,71 @@ def _apply_derived_progress(job: dict[str, object]) -> None:
             diagnostics["timing_semantics"] = "wall_clock_seconds"
             diagnostics["per_worker_summary"] = {}
 
+        for key in (
+            "clickhouse_insert_batch_size",
+            "max_concurrent_clickhouse_inserts",
+            "insert_wait_seconds",
+            "clickhouse_insert_timeout_count",
+            "clickhouse_insert_retries",
+            "clickhouse_insert_error_count",
+            "validation_mode",
+            "validation_timeout_seconds",
+        ):
+            job[key] = diagnostics.get(key)
+
+    workers_list = workers if isinstance(workers, list) else []
+    job["completed_chunk_count"] = sum(
+        int(worker.get("completed_chunks") or 0)
+        for worker in workers_list
+        if isinstance(worker, dict)
+    )
+    job["failed_chunk_count"] = sum(
+        int(worker.get("failed_chunks") or 0)
+        for worker in workers_list
+        if isinstance(worker, dict)
+    )
+    job["recommendations"] = _build_recommendations(job)
+    diagnostics = job.get("performance_diagnostics")
+    if isinstance(diagnostics, dict):
+        diagnostics["recommendations"] = job["recommendations"]
+
+
+def _build_recommendations(job: dict[str, object]) -> list[str]:
+    diagnostics = job.get("performance_diagnostics")
+    diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+    recommendations: list[str] = []
+    timeout_count = int(diagnostics.get("clickhouse_insert_timeout_count") or 0)
+    insert_wait = float(diagnostics.get("insert_wait_seconds") or 0.0)
+    insert_seconds = float(diagnostics.get("clickhouse_insert_duration_seconds") or 0.0)
+    fetch_seconds = float(diagnostics.get("oracle_fetch_duration_seconds") or 0.0)
+    validation_seconds = float(diagnostics.get("validation_duration_seconds") or 0.0)
+
+    if timeout_count > 0:
+        recommendations.append(
+            "ClickHouse insert timeout detected. Reduce CLICKHOUSE_INSERT_BATCH_SIZE and CLICKHOUSE_MAX_CONCURRENT_INSERTS before increasing workers."
+        )
+    if insert_wait > max(insert_seconds, 1.0) and timeout_count == 0:
+        recommendations.append(
+            "ClickHouse insert is stable but workers are waiting. Consider increasing CLICKHOUSE_MAX_CONCURRENT_INSERTS gradually."
+        )
+    if fetch_seconds > max(insert_seconds * 2, 1.0):
+        recommendations.append(
+            "Oracle extraction is the bottleneck. Consider increasing workers or choosing an indexed partition column."
+        )
+    if insert_seconds > max(fetch_seconds, 1.0):
+        recommendations.append(
+            "ClickHouse insert is the bottleneck. Reduce insert batch size or insert concurrency."
+        )
+
+    workers = [worker for worker in job.get("workers", []) if isinstance(worker, dict)]
+    processed_values = [int(worker.get("processed_rows") or 0) for worker in workers]
+    nonzero_values = [value for value in processed_values if value > 0]
+    if nonzero_values and max(nonzero_values) > max(min(nonzero_values) * 2, min(nonzero_values) + 1000):
+        recommendations.append("Data skew detected. Use dynamic chunk scheduling or hash mode.")
+    if validation_seconds > 30:
+        recommendations.append("Validation is expensive. Use VALIDATION_MODE=fast for huge tables.")
+    return recommendations
+
 
 def _public_job(job: dict[str, object]) -> dict[str, object]:
     public = {key: value for key, value in job.items() if not key.startswith("_")}
@@ -194,7 +274,19 @@ def create_job(
         "resolved_parallel_mode": resolved_parallel_mode,
         "worker_count": worker_count,
         "requested_workers": worker_count,
+        "dynamic_chunks_enabled": False,
+        "chunk_count": 0,
+        "completed_chunk_count": 0,
+        "failed_chunk_count": 0,
         "batch_size": batch_size,
+        "clickhouse_insert_batch_size": 0,
+        "max_concurrent_clickhouse_inserts": 0,
+        "insert_wait_seconds": 0.0,
+        "clickhouse_insert_timeout_count": 0,
+        "clickhouse_insert_retries": 0,
+        "clickhouse_insert_error_count": 0,
+        "validation_mode": "fast",
+        "validation_timeout_seconds": 0,
         "status": JobStatus.PENDING.value,
         "total_rows": 0,
         "processed_rows": 0,
@@ -219,6 +311,8 @@ def create_job(
         "validation_error_message": None,
         "workers": [],
         "performance_diagnostics": _new_performance_diagnostics(batch_size),
+        "insert_failure": None,
+        "recommendations": [],
     }
     with _LOCK:
         _JOBS[job_id] = job
@@ -310,6 +404,35 @@ def add_diagnostic_timing(job_id: str, field: str, seconds: float) -> None:
         diagnostics[field] = round(float(diagnostics.get(field) or 0.0) + seconds, 3)
 
 
+def increment_diagnostic(job_id: str, field: str, amount: int | float = 1) -> None:
+    with _LOCK:
+        job = _JOBS.get(job_id)
+        if job is None:
+            raise KeyError(f"job '{job_id}' not found")
+        diagnostics = job.get("performance_diagnostics")
+        if not isinstance(diagnostics, dict):
+            diagnostics = _new_performance_diagnostics()
+            job["performance_diagnostics"] = diagnostics
+        current = diagnostics.get(field) or 0
+        diagnostics[field] = round(float(current) + float(amount), 3)
+
+
+def append_diagnostic_list(job_id: str, field: str, value: object) -> None:
+    with _LOCK:
+        job = _JOBS.get(job_id)
+        if job is None:
+            raise KeyError(f"job '{job_id}' not found")
+        diagnostics = job.get("performance_diagnostics")
+        if not isinstance(diagnostics, dict):
+            diagnostics = _new_performance_diagnostics()
+            job["performance_diagnostics"] = diagnostics
+        values = diagnostics.setdefault(field, [])
+        if not isinstance(values, list):
+            values = []
+            diagnostics[field] = values
+        values.append(value)
+
+
 def update_performance_diagnostics(job_id: str, **fields: object) -> None:
     with _LOCK:
         job = _JOBS.get(job_id)
@@ -320,6 +443,32 @@ def update_performance_diagnostics(job_id: str, **fields: object) -> None:
             diagnostics = _new_performance_diagnostics()
             job["performance_diagnostics"] = diagnostics
         diagnostics.update(fields)
+        for key in (
+            "clickhouse_insert_batch_size",
+            "max_concurrent_clickhouse_inserts",
+            "insert_wait_seconds",
+            "clickhouse_insert_timeout_count",
+            "clickhouse_insert_retries",
+            "clickhouse_insert_error_count",
+            "validation_mode",
+            "validation_timeout_seconds",
+            "insert_failure",
+        ):
+            if key in fields:
+                job[key] = fields[key]
+
+
+def set_insert_failure(job_id: str, failure: dict[str, object]) -> None:
+    with _LOCK:
+        job = _JOBS.get(job_id)
+        if job is None:
+            raise KeyError(f"job '{job_id}' not found")
+        job["insert_failure"] = deepcopy(failure)
+        diagnostics = job.get("performance_diagnostics")
+        if not isinstance(diagnostics, dict):
+            diagnostics = _new_performance_diagnostics()
+            job["performance_diagnostics"] = diagnostics
+        diagnostics["insert_failure"] = deepcopy(failure)
 
 
 def set_worker_diagnostics(job_id: str, worker_id: int, timings: dict[str, object]) -> None:
@@ -383,6 +532,12 @@ def update_worker(job_id: str, worker_id: int, **fields: object) -> None:
             worker["_started_at_ts"] = perf_counter()
 
         worker.update(fields)
+        timings = worker.get("timings")
+        if isinstance(timings, dict):
+            worker["fetch_seconds"] = timings.get("oracle_fetch_duration_seconds", 0.0)
+            worker["convert_seconds"] = timings.get("row_conversion_duration_seconds", 0.0)
+            worker["insert_seconds"] = timings.get("clickhouse_insert_duration_seconds", 0.0)
+            worker["insert_wait_seconds"] = timings.get("insert_wait_seconds", 0.0)
         elapsed_seconds = _duration_seconds(worker.get("_started_at_ts"))
         worker["rows_per_second"] = (
             round(int(worker.get("processed_rows") or 0) / elapsed_seconds, 2)
@@ -408,6 +563,10 @@ def get_status(job_id: str) -> dict[str, object] | None:
         "partition_mode",
         "worker_count",
         "requested_workers",
+        "dynamic_chunks_enabled",
+        "chunk_count",
+        "completed_chunk_count",
+        "failed_chunk_count",
         "requested_parallel_mode",
         "resolved_parallel_mode",
         "total_rows",
@@ -428,6 +587,16 @@ def get_status(job_id: str) -> dict[str, object] | None:
         "count_match",
         "validation_status",
         "validation_error_message",
+        "validation_mode",
+        "validation_timeout_seconds",
+        "clickhouse_insert_batch_size",
+        "max_concurrent_clickhouse_inserts",
+        "insert_wait_seconds",
+        "clickhouse_insert_timeout_count",
+        "clickhouse_insert_retries",
+        "clickhouse_insert_error_count",
+        "insert_failure",
+        "recommendations",
         "workers",
         "performance_diagnostics",
     ]

@@ -247,7 +247,73 @@ description: "Phase-based task list for Oracle to ClickHouse Parallel Data Migra
 - [X] T113 [P] Add a test (e.g. `tests/test_service_layer_framework_agnostic.py`) asserting `grep`-style that `app/services/*.py` and `app/db/*.py` contain no `import fastapi` / `from fastapi` (service modules stay framework-agnostic and Flask-importable).
 - [X] T114 [P] Add a test to `tests/test_clickhouse_connection.py` asserting `clickhouse_client.insert_rows` performs a single batch `insert(...)` call for a multi-row batch (e.g. via a fake/mock client capturing one call with all rows) — i.e. it is batch-oriented, not row-by-row.
 
-**Acceptance criteria**: both GET endpoints return `performance_diagnostics` (overall + per-worker) and `warnings`; the GUI shows the timing breakdown + warnings; logs identify the slow step without printing secrets; heavy-LOB and non-indexed-range warnings appear when applicable (no index created, Oracle never modified); small-table auto-downgrade to `workers=1` works (explicit parallel still honored); NUMBER scale-0 ranges use integer boundaries; ClickHouse insert stays a true batch insert; migration + validation still pass and re-runs stay latest-only; `grep -rn "fastapi" app/services/ app/db/` returns nothing. **Manual test**: run a migration, `curl /api/migrations/{job_id}/status | python -m json.tool` shows the diagnostics block + warnings; `docker logs … | grep -Ei "password|secret"` is clean; `pytest tests/test_migration_service.py tests/test_job_service.py tests/test_clickhouse_connection.py`. **Stop point**: timing breakdown localizes the slow step (API + GUI + logs) and bounded optimizations are in place before Phase 9.
+**Acceptance criteria**: both GET endpoints return `performance_diagnostics` (overall + per-worker) and `warnings`; the GUI shows the timing breakdown + warnings; logs identify the slow step without printing secrets; heavy-LOB and non-indexed-range warnings appear when applicable (no index created, Oracle never modified); small-table auto-downgrade to `workers=1` works (explicit parallel still honored); NUMBER scale-0 ranges use integer boundaries; ClickHouse insert stays a true batch insert; migration + validation still pass and re-runs stay latest-only; `grep -rn "fastapi" app/services/ app/db/` returns nothing. **Manual test**: run a migration, `curl /api/migrations/{job_id}/status | python -m json.tool` shows the diagnostics block + warnings; `docker logs … | grep -Ei "password|secret"` is clean; `pytest tests/test_migration_service.py tests/test_job_service.py tests/test_clickhouse_connection.py`. **Stop point**: timing breakdown localizes the slow step (API + GUI + logs) and bounded optimizations are in place before Phase 8.2.
+
+---
+
+## Phase 8.2: ClickHouse Insert Timeout, Backpressure, and Validation Optimization
+
+**Goal**: Prevent ClickHouse HTTP insert timeouts on huge tables via env-driven client timeouts/compression, an insert-backpressure semaphore (independent of Oracle worker count), safer insert batching, fail-fast insert-timeout handling, default-off opt-in retry, and `fast`/`strict`/`none` validation — without changing business behavior. Additive on Phases 6–8.1; do not rewrite existing migration logic. (Maps PLAN.md §16.2 / plan.md "Phase 8.2".)
+
+**Keep business behavior**: initial full load only; drop+create target once per job; full-load Oracle rows; validate Oracle count vs ClickHouse count; no CDC/incremental/watermark/staging/append/dedup; Oracle read-only; ClickHouse writes only to `oracle_migration_hazem`; services stay framework-agnostic; routes stay thin.
+
+### Configuration (`app/config.py` + `.env.example`)
+
+- [X] T115 Add Phase 8.2 settings to `app/config.py` `Settings` + `get_settings()` (each read from its env var, never hardcoded in service logic): `clickhouse_connect_timeout_seconds` (`CLICKHOUSE_CONNECT_TIMEOUT_SECONDS`, default 15), `clickhouse_send_receive_timeout_seconds` (`CLICKHOUSE_SEND_RECEIVE_TIMEOUT_SECONDS`, default 900), `clickhouse_insert_timeout_seconds` (`CLICKHOUSE_INSERT_TIMEOUT_SECONDS`, default 900), `clickhouse_compress` (`CLICKHOUSE_COMPRESS`, default true), `clickhouse_max_concurrent_inserts` (`CLICKHOUSE_MAX_CONCURRENT_INSERTS`, default 2), `clickhouse_insert_retry_attempts` (`CLICKHOUSE_INSERT_RETRY_ATTEMPTS`, default 0, may be zero), `clickhouse_insert_retry_backoff_seconds` (`CLICKHOUSE_INSERT_RETRY_BACKOFF_SECONDS`, default 2), `migration_max_workers` (`MIGRATION_MAX_WORKERS`, default 8), `validation_mode` (`VALIDATION_MODE`, default `fast`), `validation_timeout_seconds` (`VALIDATION_TIMEOUT_SECONDS`, default 600). Change `clickhouse_insert_batch_size` default to **25000** (still env-overridable via `CLICKHOUSE_INSERT_BATCH_SIZE`; supersedes the Phase 8.1 `= MIGRATION_BATCH_SIZE` default) and change `migration_default_workers` default to **4**. `MIGRATION_BATCH_SIZE` stays the Oracle fetch size.
+- [X] T116 Add config validation in `app/config.py`: positive-integer checks (allowing `0` only for `clickhouse_insert_retry_attempts`) for all new numeric settings; reject `migration_max_workers > 16` (absolute hard cap reachable only when explicitly configured up to 16); validate `validation_mode ∈ {fast, strict, none}` and reject any other value with a clear, secret-free error so misconfiguration fails fast at settings load.
+- [X] T117 [P] Add the Phase 8.2 variables with safe defaults (no secrets) to `.env.example` at repo root: `CLICKHOUSE_CONNECT_TIMEOUT_SECONDS=15`, `CLICKHOUSE_SEND_RECEIVE_TIMEOUT_SECONDS=900`, `CLICKHOUSE_INSERT_TIMEOUT_SECONDS=900`, `CLICKHOUSE_COMPRESS=true`, `CLICKHOUSE_MAX_CONCURRENT_INSERTS=2`, `CLICKHOUSE_INSERT_BATCH_SIZE=25000`, `CLICKHOUSE_INSERT_RETRY_ATTEMPTS=0`, `CLICKHOUSE_INSERT_RETRY_BACKOFF_SECONDS=2`, `MIGRATION_DEFAULT_WORKERS=4`, `MIGRATION_MAX_WORKERS=8`, `VALIDATION_MODE=fast`, `VALIDATION_TIMEOUT_SECONDS=600`.
+
+### ClickHouse client (`app/db/clickhouse_client.py`)
+
+- [X] T118 Update `get_client(...)` in `app/db/clickhouse_client.py` to pass `connect_timeout` (from `clickhouse_connect_timeout_seconds`) and `send_receive_timeout` (from `clickhouse_send_receive_timeout_seconds`) and `compress` (from `clickhouse_compress`) into `clickhouse_connect.get_client(...)`, **capability-guarded** (use `inspect`/`try` so older `clickhouse-connect` versions that lack a kwarg do not break). Never log credentials.
+- [X] T119 In `app/db/clickhouse_client.insert_rows`, apply the per-insert timeout via `clickhouse_insert_timeout_seconds` as a query/insert setting **only when the installed driver supports it** (otherwise ignore, no crash); keep the existing target-database guard so all writes stay confined to `oracle_migration_hazem`; add a `ClickHouseInsertTimeoutError` class plus an `is_transient_connection_error(exc)` predicate that classifies HTTP "Connection aborted"/`TimeoutError`/timeout exceptions; raise `ClickHouseInsertTimeoutError` (with a credential-redacted message via `_safe_error_message`) on insert timeout so callers can fail-fast vs. opt-in retry.
+
+### Insert backpressure + batching (`app/services/migration_service.py`)
+
+- [X] T120 Add a process/job-wide `threading.BoundedSemaphore(settings.clickhouse_max_concurrent_inserts)` shared by all workers and pass it into the insert path; acquire it **immediately before** each `clickhouse_client.insert_rows` call and **release it in a `finally`** so a failed/timed-out insert never leaves it locked. Keep this semaphore **independent of the Oracle `ThreadPoolExecutor` worker count** (e.g. `workers=8`, max concurrent inserts `=2`). Measure the time spent blocked acquiring it and accumulate `insert_wait_seconds` into the job diagnostics (overall + per-worker). No FastAPI imports.
+- [X] T121 In `_copy_batches` (`app/services/migration_service.py`) keep the Oracle fetch sized by `migration_batch_size`, split each fetched batch into `clickhouse_insert_batch_size` chunks via the existing `_chunk_rows`, and insert each chunk with **one true `client.insert` batch call** (never row-by-row). Track `clickhouse_insert_batch_size`, rows-per-insert-chunk, and seconds-per-insert-chunk into the diagnostics (extends T100/T106 instrumentation). Do not change extraction or DDL behavior.
+
+### Timeout failure handling + retry (`app/services/migration_service.py` + `app/services/job_service.py`)
+
+- [X] T122 Add a cooperative cancellation `threading.Event` per job (stored/threaded into the run) in `app/services/migration_service.py`. On a `ClickHouseInsertTimeoutError` (from T119): mark the worker `FAILED`, set the cancellation event, mark the **job `FAILED`**, and have every other worker check the event at the **next safe batch boundary** (before the next `fetchmany`/insert) in `_copy_batches`/`_run_worker` and stop cleanly. Single-thread path fails the job the same way. The event must also be honored by the single-thread loop.
+- [X] T123 On insert-timeout failure, store a credential-free **insert-failure record** on the job via `app/services/job_service.py`: `failed_worker_id`, `failed_batch_number`, `range_start`, `range_end`, `inserted_rows before failure`, `exception_class`, and a redacted `exception_message`; set the job `error_message` so the GUI can render the exact text: `"ClickHouse insert timed out. Target table may be incomplete. Re-run after reducing batch size or worker concurrency."`
+- [X] T124 Gate `run_validation` in `app/services/migration_service.py` so it is **not started** when the job failed due to an insert timeout (target treated as incomplete) — i.e. `run_initial_load` only calls validation on the success path.
+- [X] T125 Implement opt-in retry in the insert path (`app/services/migration_service.py`): when `clickhouse_insert_retry_attempts > 0`, retry **only** errors for which `is_transient_connection_error` is true (T119), using exponential backoff seeded by `clickhouse_insert_retry_backoff_seconds`; never retry by default (`=0`). Count each retry into `clickhouse_insert_retries` and, when retries are enabled, append a diagnostics warning that "retrying an insert timeout can duplicate rows if ClickHouse already received the batch; full job restart (drop+recreate) is the safe recovery." Track `clickhouse_insert_timeout_count` and `clickhouse_insert_error_count`.
+
+### Worker tuning (`app/services/migration_service.py`)
+
+- [X] T126 Update `clamp_worker_count` in `app/services/migration_service.py` to clamp to `settings.migration_max_workers` (default 8) with the absolute ceiling `16` (reachable only when `MIGRATION_MAX_WORKERS` is explicitly configured up to 16), default unspecified workers to `migration_default_workers` (4), and emit a warning (via `add_warning`) when the requested worker count exceeds the safe max instead of silently inflating. Do not auto-increase workers to mask timeouts. Keep the Phase 8.1 small-table single-thread rule (T104) intact.
+
+### Validation modes (`app/services/migration_service.py` + `app/services/job_service.py`)
+
+- [X] T127 Add `ValidationStatus.SKIPPED` and `ValidationStatus.TIMEOUT` to the `ValidationStatus` enum in `app/services/job_service.py`.
+- [X] T128 Implement `VALIDATION_MODE` in `run_validation` (`app/services/migration_service.py`): **fast** — reuse the Oracle source count captured at job start (the `total_rows` already computed in `run_initial_load`, passed through to validation) and run only the ClickHouse target `COUNT(*)`, comparing start-count vs target-count; **strict** — re-run Oracle `COUNT(*)` and ClickHouse `COUNT(*)` post-load and compare; **none** — skip counting and set `validation_status=SKIPPED` (job stays `SUCCESS`, `count_match=null`). Enforce `validation_timeout_seconds`: on overrun set `validation_status=TIMEOUT` with a clear message **without hiding a successful insert** (load stays `SUCCESS`). Validation runs only `SELECT COUNT(*)` and never modifies Oracle or ClickHouse. Record `validation_mode` and validation timing into the diagnostics.
+
+### Job diagnostics state (`app/services/job_service.py`)
+
+- [X] T129 Extend the job `performance_diagnostics` block (init in `create_job`, surfaced in `get_job`/`get_status`/`_public_job`) with the Phase 8.2 fields, all credential-free: `clickhouse_insert_batch_size`, `max_concurrent_clickhouse_inserts`, `insert_wait_seconds`, `clickhouse_insert_timeout_count`, `clickhouse_insert_retries`, `clickhouse_insert_error_count`, `validation_mode`, `validation_timeout_seconds`, plus the insert-failure record (T123). Track both the Oracle fetch batch size and the ClickHouse insert batch size side by side.
+
+### API (`app/api/migration_routes.py` — thin wrappers)
+
+- [X] T130 Ensure `GET /api/migrations/{job_id}` and `GET /api/migrations/{job_id}/status` in `app/api/migration_routes.py` return the new diagnostics fields (`clickhouse_insert_batch_size`, `max_concurrent_clickhouse_inserts`, `insert_wait_seconds`, `clickhouse_insert_timeout_count`, `clickhouse_insert_retries`, `clickhouse_insert_error_count`, `validation_mode`, `validation_timeout_seconds`), the existing `validation_status` and `warnings`, and the insert-failure record. No business logic added in the route file.
+
+### GUI (`app/templates/index.html` + `app/static/app.js`)
+
+- [X] T131 Add a **ClickHouse Insert Tuning** section to `app/templates/index.html` and render it in `app/static/app.js` on each status poll, showing: insert batch size, max concurrent ClickHouse inserts, insert wait time, insert timeout count, retry count, validation mode, and validation timeout. Keep the existing progress bar, per-worker table, Performance Diagnostics, and validation displays.
+- [X] T132 In `app/static/app.js`/`app/templates/index.html`, on an insert-timeout failure show the exact message `"ClickHouse insert timed out. Target table may be incomplete. Re-run after reducing batch size or worker concurrency."` plus a suggested-action list (reduce `CLICKHOUSE_INSERT_BATCH_SIZE`; reduce `CLICKHOUSE_MAX_CONCURRENT_INSERTS`; reduce worker count; increase ClickHouse timeout only after reducing pressure). Add the helper text near Worker Threads: "For huge tables, start with 4 workers and 25k insert batch size. Increase only after checking diagnostics." and show a recommended worker count / warning when the requested workers exceed the safe max.
+
+### Tests (`tests/`)
+
+- [X] T133 [P] Add tests to `tests/test_config.py`: Phase 8.2 defaults parse correctly (timeouts 15/900/900, `CLICKHOUSE_COMPRESS=true`, `CLICKHOUSE_MAX_CONCURRENT_INSERTS=2`, `CLICKHOUSE_INSERT_BATCH_SIZE=25000`, retry 0/backoff 2, workers 4/max 8, `VALIDATION_MODE=fast`, `VALIDATION_TIMEOUT_SECONDS=600`); and invalid values are rejected (non-positive integers, `migration_max_workers > 16`, `VALIDATION_MODE=bogus`).
+- [X] T134 [P] Add a test to `tests/test_clickhouse_connection.py` asserting the ClickHouse client receives the configured `connect_timeout` / `send_receive_timeout` / `compress` (capture kwargs via a fake `clickhouse_connect.get_client`), tolerating capability-guarded omission on older drivers.
+- [X] T135 [P] Add a test to `tests/test_migration_service.py` asserting the insert semaphore limits concurrency to `clickhouse_max_concurrent_inserts` (observed max concurrent inserts ≤ configured value) while more Oracle workers run, and that the semaphore is released after a failing insert.
+- [X] T136 [P] Add a test to `tests/test_migration_service.py` asserting a `ClickHouseInsertTimeoutError` marks the worker and the job `FAILED`, stores the insert-failure record, and that validation is **not** run.
+- [X] T137 [P] Add a test to `tests/test_migration_service.py` asserting the cancellation event set on one worker's insert timeout stops other workers at the next safe batch boundary.
+- [X] T138 [P] Add tests to `tests/test_migration_service.py` for validation modes: **fast** reuses the start-of-job Oracle count and does **not** re-run Oracle `COUNT(*)`; **strict** re-runs Oracle `COUNT(*)`; **none** skips counting and sets `validation_status=SKIPPED`.
+- [X] T139 [P] Extend `tests/test_service_layer_framework_agnostic.py` to confirm `app/services/*.py` and `app/db/*.py` still contain no `import fastapi` / `from fastapi` after Phase 8.2.
+- [X] T140 [P] Add a test asserting Phase 8.2 ClickHouse writes stay restricted to `oracle_migration_hazem` (insert/count/DDL helpers reject any other target database), guarding the new timeout/retry/semaphore paths.
+
+**Acceptance criteria**: config parses all new settings and rejects invalid ones (`VALIDATION_MODE`, over-cap workers, bad integers); the client uses configured connect/send-receive/compress (and insert timeout where supported); the insert semaphore bounds concurrent inserts while Oracle worker concurrency stays independent and is always released; an insert timeout fails the worker+job, signals other workers to stop at a safe boundary, skips validation, stores the failure record, and surfaces the exact GUI message; retries are off by default and, when enabled, cover only transient connection errors with exponential backoff and a duplicate-risk warning; `fast`/`strict`/`none` validation behave as specified within `VALIDATION_TIMEOUT_SECONDS` and never modify Oracle/ClickHouse; both GET endpoints + GUI show all new diagnostics, the validation mode, and a recommended/warned worker count; services stay FastAPI-free and writes stay confined to `oracle_migration_hazem`. **Manual test**: `CLICKHOUSE_MAX_CONCURRENT_INSERTS=2` parallel `POST /api/migrations` with `workers=8`; `curl /api/migrations/{job_id}/status | python -m json.tool` shows `clickhouse_insert_*`, `max_concurrent_clickhouse_inserts`, `insert_wait_seconds`, `validation_mode`, `validation_timeout_seconds`; `VALIDATION_MODE=none` job reports `validation_status=SKIPPED`; `docker logs … | grep -Ei "password|secret"` is clean; `pytest tests/test_config.py tests/test_clickhouse_connection.py tests/test_migration_service.py tests/test_job_service.py tests/test_service_layer_framework_agnostic.py`. **Stop point**: timeouts configurable, semaphore bounds concurrency, insert timeout fails fast (no validation, clear message, stored failure record), retries off by default, the three validation modes work within their timeout, and the new diagnostics appear in the status API and GUI — before Phase 9.
 
 ---
 
@@ -287,7 +353,7 @@ description: "Phase-based task list for Oracle to ClickHouse Parallel Data Migra
 
 ### Phase order (sequential — Constitution P-IV)
 
-Phase 0 → 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 8.1 → 9 → 10. **Do not start a phase until the prior phase's acceptance criteria pass and its Stop point is satisfied.**
+Phase 0 → 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 8.1 → 8.2 → 9 → 10. **Do not start a phase until the prior phase's acceptance criteria pass and its Stop point is satisfied.**
 
 ### Key cross-phase dependencies
 
@@ -298,6 +364,7 @@ Phase 0 → 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 8.1 → 9 → 10. **
 - Within Phase 7, the Parallel Mode selector tasks (T086–T093) are additive on the engine tasks (T057–T066): the resolver maps the resolved mode onto the engine's `partition_mode`, so T057–T066 land before (or alongside) T086–T093.
 - Phase 7 (engine + selector) and Phase 6 precede Phase 8 (validation runs after load).
 - Phase 8.1 (T094–T114) is **additive on Phases 6–8**: config (T094–T095) and job state (T096–T097) come first; metadata helpers (T098–T099) are independent; instrumentation (T100–T102) precedes warning emission (T103) and the GUI (T108); tuning (T104–T105) and the insert check (T106) are independent of instrumentation; API (T107) after job state; tests (T109–T114) follow their targets.
+- Phase 8.2 (T115–T140) is **additive on Phases 6–8.1** and must not rewrite migration logic: config (T115–T117) comes first; the ClickHouse client changes (T118–T119) gate the backpressure/batching (T120–T121), failure handling + retry (T122–T125), and worker tuning (T126); validation modes (T127–T128) depend on the client/diagnostics; the diagnostics state (T129) precedes the API (T130) and GUI (T131–T132); tests (T133–T140) follow their targets. T119 (`ClickHouseInsertTimeoutError` + transient predicate) is a prerequisite for T122/T125/T136.
 
 ### Within-phase parallel opportunities
 
@@ -308,6 +375,7 @@ Phase 0 → 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 8.1 → 9 → 10. **
 - **Phase 7 (engine)**: T057–T063 edit `migration_service.py`/`job_service.py` (sequential); T064 (route) and T065 (GUI) follow; T066 `[P]` (test file) parallel with engine code.
 - **Phase 7 (selector)**: T086–T088 edit `migration_service.py` (sequential), T089 edits `job_service.py`; T090 (route) follows; T091 (HTML) and T092 (JS) follow; T093 `[P]` (new test file) parallel with the resolver once T086–T088 exist.
 - **Phase 8.1**: T098, T099 `[P]` (independent metadata helpers); T109–T114 `[P]` (distinct test files/cases). T094→T095 (config), T096→T097 (job state), and T100→T101→T102→T103 (instrumentation then warnings) are sequential (same files).
+- **Phase 8.2**: T117 `[P]` (`.env.example`); T133–T140 `[P]` (distinct test files/cases). T115→T116 (config) and T118→T119 (client) are sequential (same files); T120→T121→T122→T123→T124→T125→T126 and T127→T128→T129 edit `migration_service.py`/`job_service.py` (sequential); T130 (route) and T131–T132 (GUI) follow.
 - **Phase 9**: T076, T077 `[P]` (same README, append-only sections) after T075.
 
 ---
@@ -341,8 +409,10 @@ The MVP is the **single-table initial-full-load path (spec US1)** = Phases 0–6
 5. Phase 6 → **MVP: first real migration**.
 6. Phase 7 → speed for large tables.
 7. Phase 8 → trust (reconciliation).
-8. Phase 9 → team run.
-9. Phase 10 → production hardening.
+8. Phase 8.1 → diagnostics + bounded speed tuning.
+9. Phase 8.2 → ClickHouse insert timeout resilience (backpressure, fail-fast, validation modes).
+10. Phase 9 → team run.
+11. Phase 10 → production hardening.
 
 ---
 

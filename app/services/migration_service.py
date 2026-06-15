@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time as datetime_time
 from decimal import Decimal
-from threading import Thread
-from time import perf_counter
+from queue import Empty, Queue
+from threading import BoundedSemaphore, Event, Thread
+from time import perf_counter, sleep
 from typing import Any, Iterator
 
 from app.config import TARGET_DATABASE, get_settings
@@ -21,6 +22,12 @@ MODE_TO_PARTITION = {
     "hash": "hash",
 }
 SMALL_TABLE_WARNING = "Small table detected; single-thread mode may be faster than parallel mode."
+INSERT_TIMEOUT_MESSAGE = (
+    "ClickHouse insert timed out. Target table may be incomplete. Re-run after reducing batch size or worker concurrency."
+)
+INSERT_RETRY_WARNING = (
+    "Retrying an insert timeout can duplicate rows if ClickHouse already received the batch; full job restart (drop+recreate) is the safe recovery."
+)
 
 
 @dataclass(frozen=True)
@@ -47,6 +54,12 @@ class PartitionRange:
     end: Any
     inclusive_end: bool
     include_nulls: bool = False
+
+
+@dataclass
+class InsertController:
+    semaphore: BoundedSemaphore
+    cancellation: Event
 
 
 def _safe_error_message(exc: Exception, step: str | None = None) -> str:
@@ -76,6 +89,112 @@ def _copy_phase_seconds(timings: dict[str, float]) -> float:
     )
 
 
+def _new_insert_controller() -> InsertController:
+    settings = get_settings()
+    return InsertController(
+        semaphore=BoundedSemaphore(settings.clickhouse_max_concurrent_inserts),
+        cancellation=Event(),
+    )
+
+
+def _raise_if_cancelled(controller: InsertController | None) -> None:
+    if controller is not None and controller.cancellation.is_set():
+        raise RuntimeError("migration cancelled after another worker failed")
+
+
+def _record_insert_failure(
+    *,
+    job_id: str,
+    worker_id: int | None,
+    chunk_id: int | None,
+    batch_number: int,
+    range_start: Any,
+    range_end: Any,
+    inserted_rows_before_failure: int,
+    exc: Exception,
+) -> None:
+    failure = {
+        "worker_id": worker_id,
+        "failed_worker_id": worker_id,
+        "chunk_id": chunk_id,
+        "batch_number": batch_number,
+        "failed_batch_number": batch_number,
+        "range_start": _serialize_bound(range_start),
+        "range_end": _serialize_bound(range_end),
+        "inserted_rows_before_failure": inserted_rows_before_failure,
+        "exception_class": exc.__class__.__name__,
+        "exception_message": _safe_error_message(exc),
+    }
+    job_service.set_insert_failure(job_id, failure)
+    job_service.update_job(
+        job_id,
+        status=job_service.JobStatus.FAILED,
+        error_message=INSERT_TIMEOUT_MESSAGE,
+    )
+
+
+def _insert_with_retry(
+    *,
+    job_id: str,
+    target_table: str,
+    insert_chunk: list[Any],
+    column_names: list[str],
+    target_database: str,
+    clickhouse: Any,
+    controller: InsertController | None = None,
+) -> tuple[int, float, float]:
+    settings = get_settings()
+    attempts = settings.clickhouse_insert_retry_attempts
+    if attempts > 0:
+        job_service.add_warning(job_id, INSERT_RETRY_WARNING)
+    attempt = 0
+    total_wait_seconds = 0.0
+    total_insert_seconds = 0.0
+    while True:
+        acquired_permit = False
+        try:
+            wait_started_at = perf_counter()
+            if controller is not None:
+                controller.semaphore.acquire()
+                acquired_permit = True
+            wait_seconds = perf_counter() - wait_started_at
+            total_wait_seconds += wait_seconds
+            job_service.increment_diagnostic(job_id, "insert_wait_seconds", wait_seconds)
+
+            insert_started_at = perf_counter()
+            try:
+                inserted = clickhouse_client.insert_rows(
+                    target_table,
+                    insert_chunk,
+                    column_names,
+                    target_database,
+                    clickhouse,
+                )
+            finally:
+                insert_seconds = perf_counter() - insert_started_at
+                total_insert_seconds += insert_seconds
+                job_service.add_diagnostic_timing(
+                    job_id,
+                    "clickhouse_insert_duration_seconds",
+                    insert_seconds,
+                )
+                if acquired_permit:
+                    controller.semaphore.release()
+            return inserted, total_wait_seconds, total_insert_seconds
+        except clickhouse_client.ClickHouseInsertTimeoutError:
+            job_service.increment_diagnostic(job_id, "clickhouse_insert_timeout_count")
+            job_service.increment_diagnostic(job_id, "clickhouse_insert_error_count")
+            if attempt >= attempts:
+                raise
+        except Exception as exc:
+            job_service.increment_diagnostic(job_id, "clickhouse_insert_error_count")
+            if attempt >= attempts or not clickhouse_client.is_transient_connection_error(exc):
+                raise
+        attempt += 1
+        job_service.increment_diagnostic(job_id, "clickhouse_insert_retries")
+        sleep(settings.clickhouse_insert_retry_backoff_seconds * (2 ** (attempt - 1)))
+
+
 def _chunk_rows(rows: list[Any], chunk_size: int) -> Iterator[list[Any]]:
     for index in range(0, len(rows), chunk_size):
         yield rows[index : index + chunk_size]
@@ -90,7 +209,17 @@ def clamp_worker_count(workers: int | None) -> int:
     requested = workers if workers is not None else settings.migration_default_workers
     if requested <= 0:
         raise ValueError("workers must be greater than zero")
-    return min(requested, MAX_WORKERS)
+    return min(requested, settings.migration_max_workers, settings.migration_absolute_max_workers)
+
+
+def _requested_worker_warning(requested: int | None, resolved: int) -> str | None:
+    settings = get_settings()
+    if requested is not None and requested > resolved:
+        return (
+            f"Requested workers {requested} exceeds safe max {settings.migration_max_workers}; "
+            f"using {resolved}."
+        )
+    return None
 
 
 def _normalize_data_type(data_type: Any) -> str:
@@ -228,7 +357,9 @@ def compute_numeric_ranges(
     workers: int,
     integer_boundaries: bool = False,
 ) -> list[PartitionRange]:
-    worker_count = clamp_worker_count(workers)
+    if workers <= 0:
+        raise ValueError("workers must be greater than zero")
+    worker_count = workers
     if min_value is None or max_value is None:
         return [
             PartitionRange(
@@ -311,7 +442,9 @@ def _as_datetime(value: Any) -> datetime:
 
 
 def compute_date_ranges(min_ts: Any, max_ts: Any, workers: int) -> list[PartitionRange]:
-    worker_count = clamp_worker_count(workers)
+    if workers <= 0:
+        raise ValueError("workers must be greater than zero")
+    worker_count = workers
     if min_ts is None or max_ts is None:
         return [
             PartitionRange(
@@ -444,6 +577,10 @@ def _mark_validation_unavailable(
     source_count: int | None = None,
     target_count: int | None = None,
 ) -> None:
+    job_service.add_warning(
+        job_id,
+        "Data load completed, but validation failed; row counts were not verified.",
+    )
     job_service.update_job(
         job_id,
         status=job_service.JobStatus.SUCCESS,
@@ -472,11 +609,59 @@ def _mark_validation_success(
     )
 
 
+def _validation_counts(job: dict[str, object], validation_mode: str) -> tuple[int, int]:
+    if validation_mode == "fast":
+        source_count = int(job.get("total_rows") or 0)
+    else:
+        source_count = count_source(
+            str(job.get("source_schema") or ""),
+            str(job.get("source_table") or ""),
+        )
+    target_count = count_target(
+        str(job.get("target_table") or ""),
+        str(job.get("target_database") or TARGET_DATABASE),
+    )
+    return source_count, target_count
+
+
+def _run_validation_counts_with_timeout(
+    job: dict[str, object],
+    validation_mode: str,
+    timeout_seconds: int,
+) -> tuple[int, int] | None:
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(_validation_counts, job, validation_mode)
+    try:
+        return future.result(timeout=timeout_seconds)
+    except FutureTimeoutError:
+        future.cancel()
+        return None
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
 def run_validation(job_id: str) -> None:
     validation_started_at = perf_counter()
+    settings = get_settings()
     job = job_service.get_job(job_id)
     if job is None:
         raise KeyError(f"job '{job_id}' not found")
+
+    if settings.validation_mode == "none":
+        _record_timing(job_id, "validation_duration_seconds", validation_started_at)
+        job_service.update_job(
+            job_id,
+            status=job_service.JobStatus.SUCCESS,
+            count_match=None,
+            validation_status=job_service.ValidationStatus.SKIPPED.value,
+            validation_error_message="Validation skipped by VALIDATION_MODE=none.",
+        )
+        job_service.update_performance_diagnostics(
+            job_id,
+            validation_mode=settings.validation_mode,
+            validation_timeout_seconds=settings.validation_timeout_seconds,
+        )
+        return
 
     job_service.update_job(
         job_id,
@@ -486,14 +671,27 @@ def run_validation(job_id: str) -> None:
     source_count: int | None = None
     target_count: int | None = None
     try:
-        source_count = count_source(
-            str(job.get("source_schema") or ""),
-            str(job.get("source_table") or ""),
+        counts = _run_validation_counts_with_timeout(
+            job,
+            settings.validation_mode,
+            settings.validation_timeout_seconds,
         )
-        target_count = count_target(
-            str(job.get("target_table") or ""),
-            str(job.get("target_database") or TARGET_DATABASE),
-        )
+        if counts is None:
+            job_service.add_warning(
+                job_id,
+                "Data load completed, but validation timed out; row counts were not verified.",
+            )
+            job_service.update_job(
+                job_id,
+                status=job_service.JobStatus.SUCCESS,
+                count_match=None,
+                validation_status=job_service.ValidationStatus.TIMEOUT.value,
+                validation_error_message=(
+                    f"Validation exceeded {settings.validation_timeout_seconds} seconds."
+                ),
+            )
+            return
+        source_count, target_count = counts
         count_match = source_count == target_count
         if count_match:
             _mark_validation_success(job_id, source_count, target_count)
@@ -506,6 +704,11 @@ def run_validation(job_id: str) -> None:
         _mark_validation_unavailable(job_id, message, source_count, target_count)
     finally:
         _record_timing(job_id, "validation_duration_seconds", validation_started_at)
+        job_service.update_performance_diagnostics(
+            job_id,
+            validation_mode=settings.validation_mode,
+            validation_timeout_seconds=settings.validation_timeout_seconds,
+        )
 
 
 def _select_source_sql(schema: str, table: str, column_names: list[str]) -> str:
@@ -598,16 +801,27 @@ def _build_request(
     resolved_batch_size = batch_size or settings.migration_batch_size
     if resolved_batch_size <= 0:
         raise ValueError("batch_size must be greater than zero")
+    requested_workers = workers if workers is not None else settings.migration_default_workers
+    clamped_workers = clamp_worker_count(workers)
     mode_resolution = resolve_parallel_mode(
         parallel_mode,
         _clean(partition_column) or None,
         column_metadata,
-        clamp_worker_count(workers),
+        clamped_workers,
     )
     partition_metadata = _find_column(_clean(partition_column) or None, column_metadata)
     partition_column_scale = None
     if partition_metadata is not None and partition_metadata.get("data_scale") is not None:
         partition_column_scale = int(partition_metadata["data_scale"])
+
+    warning_message = (
+        mode_resolution["warning_message"]
+        if isinstance(mode_resolution["warning_message"], str)
+        else None
+    )
+    worker_warning = _requested_worker_warning(requested_workers, int(mode_resolution["worker_count"]))
+    if worker_warning:
+        warning_message = f"{warning_message} {worker_warning}" if warning_message else worker_warning
 
     return InitialLoadRequest(
         source_schema=_clean(source_schema),
@@ -620,9 +834,7 @@ def _build_request(
         requested_parallel_mode=str(mode_resolution["requested_parallel_mode"]),
         resolved_parallel_mode=str(mode_resolution["resolved_parallel_mode"]),
         partition_mode=str(mode_resolution["partition_mode"]),
-        warning_message=mode_resolution["warning_message"]
-        if isinstance(mode_resolution["warning_message"], str)
-        else None,
+        warning_message=warning_message,
         partition_column_scale=partition_column_scale,
         target_database=target_database,
     )
@@ -700,6 +912,8 @@ def launch_initial_load(
         warning_message=request.warning_message,
         batch_size=request.batch_size,
     )
+    if workers is not None:
+        job_service.update_job(job_id, requested_workers=workers)
     thread = Thread(target=run_initial_load, args=(job_id, request), daemon=True)
     thread.start()
     return job_id
@@ -754,6 +968,11 @@ def _copy_batches(
     column_names: list[str],
     job_id: str,
     worker_id: int | None = None,
+    controller: InsertController | None = None,
+    partition_range: PartitionRange | None = None,
+    processed_offset: int = 0,
+    inserted_offset: int = 0,
+    batch_offset: int = 0,
 ) -> tuple[int, int, int]:
     settings = get_settings()
     clickhouse = None
@@ -768,6 +987,7 @@ def _copy_batches(
         "oracle_fetch_duration_seconds": 0.0,
         "row_conversion_duration_seconds": 0.0,
         "clickhouse_insert_duration_seconds": 0.0,
+        "insert_wait_seconds": 0.0,
         "batches_completed": 0,
         "average_seconds_per_batch": 0.0,
     }
@@ -812,6 +1032,7 @@ def _copy_batches(
                 )
 
                 while True:
+                    _raise_if_cancelled(controller)
                     step = "oracle_fetch"
                     started_at = perf_counter()
                     batch = cursor.fetchmany(request.batch_size)
@@ -841,21 +1062,48 @@ def _copy_batches(
                         normalized_batch,
                         settings.clickhouse_insert_batch_size,
                     ):
+                        _raise_if_cancelled(controller)
                         step = "clickhouse_insert"
-                        started_at = perf_counter()
-                        inserted += clickhouse_client.insert_rows(
-                            target_table,
-                            insert_chunk,
-                            column_names,
-                            request.target_database,
-                            clickhouse,
-                        )
-                        elapsed = perf_counter() - started_at
-                        worker_timings["clickhouse_insert_duration_seconds"] += elapsed
-                        job_service.add_diagnostic_timing(
+                        try:
+                            inserted_count, wait_elapsed, insert_elapsed = _insert_with_retry(
+                                job_id=job_id,
+                                target_table=target_table,
+                                insert_chunk=insert_chunk,
+                                column_names=column_names,
+                                target_database=request.target_database,
+                                clickhouse=clickhouse,
+                                controller=controller,
+                            )
+                            inserted += inserted_count
+                        except clickhouse_client.ClickHouseInsertTimeoutError as exc:
+                            if controller is not None:
+                                controller.cancellation.set()
+                            _record_insert_failure(
+                                job_id=job_id,
+                                worker_id=worker_id,
+                                chunk_id=partition_range.worker_id if partition_range else None,
+                                batch_number=batch_offset + batches_completed + 1,
+                                range_start=partition_range.start if partition_range else None,
+                                range_end=partition_range.end if partition_range else None,
+                                inserted_rows_before_failure=inserted_offset + inserted_rows + inserted,
+                                exc=exc,
+                            )
+                            if worker_id is not None:
+                                job_service.update_worker(
+                                    job_id,
+                                    worker_id,
+                                    status=job_service.JobStatus.FAILED,
+                                    error_message=INSERT_TIMEOUT_MESSAGE,
+                                )
+                            raise
+                        worker_timings["insert_wait_seconds"] += wait_elapsed
+                        worker_timings["clickhouse_insert_duration_seconds"] += insert_elapsed
+                        job_service.increment_diagnostic(job_id, "insert_chunk_count")
+                        job_service.append_diagnostic_list(job_id, "rows_per_insert_chunk", len(insert_chunk))
+                        job_service.append_diagnostic_list(
                             job_id,
-                            "clickhouse_insert_duration_seconds",
-                            elapsed,
+                            "insert_chunk_duration_seconds",
+                            round(insert_elapsed, 3),
                         )
                     processed_rows += len(batch)
                     inserted_rows += inserted
@@ -870,21 +1118,23 @@ def _copy_batches(
                     if worker_id is None:
                         job_service.update_job_progress(
                             job_id,
-                            processed_rows=processed_rows,
-                            inserted_rows=inserted_rows,
-                            batches_completed=batches_completed,
-                            current_batch_number=batches_completed,
+                            processed_rows=processed_offset + processed_rows,
+                            inserted_rows=inserted_offset + inserted_rows,
+                            batches_completed=batch_offset + batches_completed,
+                            current_batch_number=batch_offset + batches_completed,
                         )
                     else:
                         job_service.update_worker(
                             job_id,
                             worker_id,
-                            processed_rows=processed_rows,
-                            inserted_rows=inserted_rows,
-                            batches_completed=batches_completed,
+                            processed_rows=processed_offset + processed_rows,
+                            inserted_rows=inserted_offset + inserted_rows,
+                            batches_completed=batch_offset + batches_completed,
                             timings=dict(worker_timings),
                         )
         return processed_rows, inserted_rows, batches_completed
+    except clickhouse_client.ClickHouseInsertTimeoutError:
+        raise
     except Exception as exc:  # noqa: BLE001 - caller stores credential-free step failure
         raise RuntimeError(_safe_error_message(exc, step)) from exc
     finally:
@@ -918,6 +1168,9 @@ def _worker_base(
         "partition_mode": request.partition_mode,
         "resolved_parallel_mode": request.resolved_parallel_mode,
         "partition_column": request.partition_column,
+        "current_chunk_id": None,
+        "completed_chunks": 0,
+        "failed_chunks": 0,
         "range_start": _serialize_bound(range_start),
         "range_end": _serialize_bound(range_end),
         "status": job_service.JobStatus.PENDING.value,
@@ -925,11 +1178,16 @@ def _worker_base(
         "inserted_rows": 0,
         "batches_completed": 0,
         "rows_per_second": 0.0,
+        "fetch_seconds": 0.0,
+        "convert_seconds": 0.0,
+        "insert_seconds": 0.0,
+        "insert_wait_seconds": 0.0,
         "error_message": None,
     }
 
 
 def _build_worker_ranges(request: InitialLoadRequest) -> list[PartitionRange]:
+    settings = get_settings()
     if request.partition_mode == "hash":
         return [
             PartitionRange(worker_id=worker_id, start=None, end=None, inclusive_end=False)
@@ -944,14 +1202,24 @@ def _build_worker_ranges(request: InitialLoadRequest) -> list[PartitionRange]:
         request.partition_column,
     )
     if request.partition_mode == "numeric":
+        chunk_count = (
+            request.workers * settings.migration_chunks_per_worker
+            if settings.migration_dynamic_chunks_enabled
+            else request.workers
+        )
         return compute_numeric_ranges(
             min_value,
             max_value,
-            request.workers,
+            chunk_count,
             integer_boundaries=request.partition_column_scale == 0,
         )
     if request.partition_mode == "date":
-        return compute_date_ranges(min_value, max_value, request.workers)
+        chunk_count = (
+            request.workers * settings.migration_chunks_per_worker
+            if settings.migration_dynamic_chunks_enabled
+            else request.workers
+        )
+        return compute_date_ranges(min_value, max_value, chunk_count)
     raise ValueError(f"unsupported partition mode '{request.partition_mode}'")
 
 
@@ -960,42 +1228,97 @@ def _run_worker(
     request: InitialLoadRequest,
     target_table: str,
     column_names: list[str],
-    partition_range: PartitionRange,
+    work_queue: Queue[PartitionRange],
+    controller: InsertController,
+    worker_id: int,
 ) -> None:
-    worker_id = partition_range.worker_id
     job_service.update_worker(job_id, worker_id, status=job_service.JobStatus.RUNNING)
     try:
-        binds: dict[str, Any] = {}
-        if request.partition_mode == "hash":
-            if not request.partition_column:
-                raise ValueError("hash mode requires a partition/hash column")
-            column = _quote_oracle_identifier(request.partition_column)
-            where_clause = f"MOD(NVL(ORA_HASH({column}), 0), :workers) = :worker_id"
-            binds = {"workers": request.workers, "worker_id": worker_id}
-        else:
-            if not request.partition_column:
-                raise ValueError("range mode requires a partition/hash column")
-            where_clause = _range_where_clause(request.partition_column, partition_range)
-            binds = {"range_start": partition_range.start, "range_end": partition_range.end}
+        while not controller.cancellation.is_set():
+            try:
+                partition_range = work_queue.get_nowait()
+            except Empty:
+                break
 
-        select_sql = _select_partition_sql(
-            request.source_schema,
-            request.source_table,
-            column_names,
-            where_clause,
-        )
-        _copy_batches(
-            select_sql=select_sql,
-            binds=binds,
-            request=request,
-            target_table=target_table,
-            column_names=column_names,
-            job_id=job_id,
-            worker_id=worker_id,
-        )
+            status = job_service.get_status(job_id) or {}
+            workers = status.get("workers") if isinstance(status.get("workers"), list) else []
+            current_worker = next(
+                (worker for worker in workers if isinstance(worker, dict) and worker.get("worker_id") == worker_id),
+                {},
+            )
+            processed_offset = int(current_worker.get("processed_rows") or 0)
+            inserted_offset = int(current_worker.get("inserted_rows") or 0)
+            batch_offset = int(current_worker.get("batches_completed") or 0)
+            completed_chunks = int(current_worker.get("completed_chunks") or 0)
+
+            job_service.update_worker(
+                job_id,
+                worker_id,
+                status=job_service.JobStatus.RUNNING,
+                current_chunk_id=partition_range.worker_id,
+                range_start=_serialize_bound(partition_range.start),
+                range_end=_serialize_bound(partition_range.end),
+                error_message=None,
+            )
+
+            binds: dict[str, Any] = {}
+            if request.partition_mode == "hash":
+                if not request.partition_column:
+                    raise ValueError("hash mode requires a partition/hash column")
+                column = _quote_oracle_identifier(request.partition_column)
+                where_clause = f"MOD(NVL(ORA_HASH({column}), 0), :workers) = :worker_id"
+                binds = {"workers": request.workers, "worker_id": partition_range.worker_id}
+            else:
+                if not request.partition_column:
+                    raise ValueError("range mode requires a partition/hash column")
+                where_clause = _range_where_clause(request.partition_column, partition_range)
+                binds = {"range_start": partition_range.start, "range_end": partition_range.end}
+
+            select_sql = _select_partition_sql(
+                request.source_schema,
+                request.source_table,
+                column_names,
+                where_clause,
+            )
+            try:
+                _copy_batches(
+                    select_sql=select_sql,
+                    binds=binds,
+                    request=request,
+                    target_table=target_table,
+                    column_names=column_names,
+                    job_id=job_id,
+                    worker_id=worker_id,
+                    controller=controller,
+                    partition_range=partition_range,
+                    processed_offset=processed_offset,
+                    inserted_offset=inserted_offset,
+                    batch_offset=batch_offset,
+                )
+            except clickhouse_client.ClickHouseInsertTimeoutError:
+                job_service.update_worker(
+                    job_id,
+                    worker_id,
+                    status=job_service.JobStatus.FAILED,
+                    failed_chunks=int(current_worker.get("failed_chunks") or 0) + 1,
+                    error_message=INSERT_TIMEOUT_MESSAGE,
+                )
+                raise
+            job_service.update_worker(
+                job_id,
+                worker_id,
+                completed_chunks=completed_chunks + 1,
+            )
+            work_queue.task_done()
+        if controller.cancellation.is_set():
+            job_service.update_worker(job_id, worker_id, status=job_service.JobStatus.CANCELLED)
+            return
         job_service.update_worker(job_id, worker_id, status=job_service.JobStatus.SUCCESS)
+    except clickhouse_client.ClickHouseInsertTimeoutError:
+        raise
     except Exception as exc:  # noqa: BLE001 - worker error is surfaced on the job
         message = _safe_error_message(exc)
+        controller.cancellation.set()
         job_service.update_worker(
             job_id,
             worker_id,
@@ -1011,6 +1334,8 @@ def run_parallel(
     target_table: str,
     column_names: list[str],
 ) -> None:
+    settings = get_settings()
+    controller = _new_insert_controller()
     started_at = perf_counter()
     try:
         ranges = _build_worker_ranges(request)
@@ -1020,38 +1345,69 @@ def run_parallel(
     if not ranges:
         job_service.set_workers(job_id, [])
         return
-    if len(ranges) != request.workers:
-        job_service.update_job(job_id, worker_count=len(ranges))
+    job_service.update_job(
+        job_id,
+        worker_count=request.workers,
+        dynamic_chunks_enabled=settings.migration_dynamic_chunks_enabled and request.partition_mode in {"numeric", "date"},
+        chunk_count=len(ranges),
+    )
 
     workers = [
         _worker_base(
-            partition_range.worker_id,
+            worker_id,
             request,
-            partition_range.start,
-            partition_range.end,
+            None,
+            None,
         )
-        for partition_range in ranges
+        for worker_id in range(min(request.workers, len(ranges)))
     ]
     job_service.set_workers(job_id, workers)
+    work_queue: Queue[PartitionRange] = Queue()
+    for item in ranges:
+        work_queue.put(item)
 
-    with ThreadPoolExecutor(max_workers=min(request.workers, len(ranges))) as executor:
-        futures = [
-            executor.submit(_run_worker, job_id, request, target_table, column_names, item)
-            for item in ranges
-        ]
+    max_pool_workers = min(request.workers, len(ranges))
+    with ThreadPoolExecutor(max_workers=max_pool_workers) as executor:
+        futures = []
+        for worker_id in range(max_pool_workers):
+            futures.append(
+                executor.submit(_run_worker, job_id, request, target_table, column_names, work_queue, controller, worker_id)
+            )
         errors: list[str] = []
         for future in as_completed(futures):
             try:
                 future.result()
+            except clickhouse_client.ClickHouseInsertTimeoutError as exc:
+                controller.cancellation.set()
+                errors.append(_safe_error_message(exc))
             except Exception as exc:  # noqa: BLE001 - collect all completed worker errors
+                controller.cancellation.set()
                 errors.append(_safe_error_message(exc))
         if errors:
             raise RuntimeError(errors[0])
 
 
 def run_initial_load(job_id: str, request: InitialLoadRequest) -> None:
+    settings = get_settings()
+    controller = _new_insert_controller()
     try:
         job_service.update_job(job_id, status=job_service.JobStatus.RUNNING)
+        job_service.update_performance_diagnostics(
+            job_id,
+            oracle_fetch_batch_size=request.batch_size,
+            batch_size=request.batch_size,
+            clickhouse_insert_batch_size=settings.clickhouse_insert_batch_size,
+            max_concurrent_clickhouse_inserts=settings.clickhouse_max_concurrent_inserts,
+            validation_mode=settings.validation_mode,
+            validation_timeout_seconds=settings.validation_timeout_seconds,
+        )
+        job_service.update_job(
+            job_id,
+            clickhouse_insert_batch_size=settings.clickhouse_insert_batch_size,
+            max_concurrent_clickhouse_inserts=settings.clickhouse_max_concurrent_inserts,
+            validation_mode=settings.validation_mode,
+            validation_timeout_seconds=settings.validation_timeout_seconds,
+        )
         _ensure_source_exists(request.source_schema, request.source_table)
         if request.warning_message:
             job_service.add_warning(job_id, request.warning_message)
@@ -1093,6 +1449,7 @@ def run_initial_load(job_id: str, request: InitialLoadRequest) -> None:
                 target_table=target_table,
                 column_names=column_names,
                 job_id=job_id,
+                controller=controller,
             )
         else:
             run_parallel(job_id, request, target_table, column_names)
@@ -1107,8 +1464,25 @@ def run_initial_load(job_id: str, request: InitialLoadRequest) -> None:
             remaining_rows=0,
             progress_percent=100.0,
         )
-        run_validation(job_id)
+        latest_job = job_service.get_job(job_id) or {}
+        if latest_job.get("status") != job_service.JobStatus.FAILED.value:
+            run_validation(job_id)
+    except clickhouse_client.ClickHouseInsertTimeoutError:
+        controller.cancellation.set()
+        job_service.update_job(
+            job_id,
+            status=job_service.JobStatus.FAILED,
+            error_message=INSERT_TIMEOUT_MESSAGE,
+        )
     except Exception as exc:  # noqa: BLE001 - job surfaces a credential-free failure
+        current_job = job_service.get_job(job_id) or {}
+        if current_job.get("insert_failure"):
+            job_service.update_job(
+                job_id,
+                status=job_service.JobStatus.FAILED,
+                error_message=INSERT_TIMEOUT_MESSAGE,
+            )
+            return
         job_service.update_job(
             job_id,
             status=job_service.JobStatus.FAILED,

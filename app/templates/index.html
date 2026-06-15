@@ -74,7 +74,10 @@
 
               <label for="worker-threads">
                 Worker Threads
-                <input id="worker-threads" name="workers" type="number" min="1" max="16" value="8">
+                <input id="worker-threads" name="workers" type="number" min="1" max="16" value="4">
+                <span class="field-help">
+                  For huge tables, start with a stable baseline: multiple Oracle workers, smaller ClickHouse insert chunks, and limited concurrent ClickHouse inserts. Increase workers or insert concurrency only after diagnostics show ClickHouse is stable.
+                </span>
               </label>
             </div>
           </fieldset>
@@ -164,6 +167,73 @@
           </dl>
 
           <p class="error-message" id="migration-error" hidden></p>
+          <div class="timeout-actions" id="timeout-actions" hidden>
+            <h3>Suggested Action</h3>
+            <ul>
+              <li>Reduce <code>CLICKHOUSE_INSERT_BATCH_SIZE</code>.</li>
+              <li>Reduce <code>CLICKHOUSE_MAX_CONCURRENT_INSERTS</code>.</li>
+              <li>Reduce worker count if ClickHouse remains overloaded.</li>
+              <li>Increase timeout only after reducing pressure.</li>
+            </ul>
+          </div>
+
+          <section class="diagnostics-panel" aria-label="ClickHouse insert tuning">
+            <h3>ClickHouse Insert Tuning</h3>
+            <dl class="metrics-grid">
+              <div>
+                <dt>Insert Batch Size</dt>
+                <dd id="tuning-insert-batch-size">0</dd>
+              </div>
+              <div>
+                <dt>Max Concurrent Inserts</dt>
+                <dd id="tuning-max-concurrent-inserts">0</dd>
+              </div>
+              <div>
+                <dt>Insert Wait Time</dt>
+                <dd id="tuning-insert-wait">0s</dd>
+              </div>
+              <div>
+                <dt>Insert Timeout Count</dt>
+                <dd id="tuning-timeout-count">0</dd>
+              </div>
+              <div>
+                <dt>Insert Error Count</dt>
+                <dd id="tuning-error-count">0</dd>
+              </div>
+              <div>
+                <dt>Retry Count</dt>
+                <dd id="tuning-retry-count">0</dd>
+              </div>
+              <div>
+                <dt>Validation Mode</dt>
+                <dd id="tuning-validation-mode">fast</dd>
+              </div>
+              <div>
+                <dt>Validation Timeout</dt>
+                <dd id="tuning-validation-timeout">0s</dd>
+              </div>
+              <div>
+                <dt>Dynamic Chunks Enabled</dt>
+                <dd id="tuning-dynamic-chunks">false</dd>
+              </div>
+              <div>
+                <dt>Chunk Count</dt>
+                <dd id="tuning-chunk-count">0</dd>
+              </div>
+              <div>
+                <dt>Completed Chunks</dt>
+                <dd id="tuning-completed-chunks">0</dd>
+              </div>
+              <div>
+                <dt>Failed Chunks</dt>
+                <dd id="tuning-failed-chunks">0</dd>
+              </div>
+            </dl>
+            <div class="warnings-panel">
+              <h4>Recommendations</h4>
+              <ul id="tuning-recommendations"><li>No recommendations yet.</li></ul>
+            </div>
+          </section>
 
           <section class="diagnostics-panel" aria-label="Performance diagnostics">
             <h3>Performance Diagnostics</h3>
@@ -269,6 +339,7 @@
                 <thead>
                   <tr>
                     <th>Worker</th>
+                    <th>Chunk</th>
                     <th>Mode</th>
                     <th>Column</th>
                     <th>Range</th>
@@ -284,7 +355,7 @@
                   </tr>
                 </thead>
                 <tbody id="worker-progress-body">
-                  <tr><td colspan="13">No worker progress yet.</td></tr>
+                  <tr><td colspan="14">No worker progress yet.</td></tr>
                 </tbody>
               </table>
             </div>

@@ -62,6 +62,15 @@ def test_create_job_initializes_phase_6_fields() -> None:
         "timing_semantics",
         "per_worker_summary",
         "per_worker",
+        "clickhouse_insert_batch_size",
+        "max_concurrent_clickhouse_inserts",
+        "insert_wait_seconds",
+        "clickhouse_insert_timeout_count",
+        "clickhouse_insert_retries",
+        "clickhouse_insert_error_count",
+        "validation_mode",
+        "validation_timeout_seconds",
+        "insert_failure",
     ):
         assert key in diagnostics
 
@@ -257,3 +266,22 @@ def test_worker_diagnostics_surface_in_status() -> None:
         "max": 0.2,
         "average": 0.2,
     }
+
+
+def test_adaptive_recommendations_surface_from_diagnostics() -> None:
+    job_id = job_service.create_job(
+        source_schema="CM",
+        source_table="COMPONENT",
+        target_database=TARGET_DATABASE,
+        target_table="CM__COMPONENT",
+    )
+    job_service.update_performance_diagnostics(
+        job_id,
+        clickhouse_insert_timeout_count=1,
+        clickhouse_insert_duration_seconds=100.0,
+    )
+
+    status = job_service.get_status(job_id)
+
+    assert status is not None
+    assert "ClickHouse insert timeout detected. Reduce CLICKHOUSE_INSERT_BATCH_SIZE" in status["recommendations"][0]

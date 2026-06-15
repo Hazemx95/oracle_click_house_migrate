@@ -28,6 +28,20 @@ const elements = {
   requestedParallelMode: document.querySelector("#requested-parallel-mode"),
   resolvedParallelMode: document.querySelector("#resolved-parallel-mode"),
   migrationError: document.querySelector("#migration-error"),
+  timeoutActions: document.querySelector("#timeout-actions"),
+  tuningInsertBatchSize: document.querySelector("#tuning-insert-batch-size"),
+  tuningMaxConcurrentInserts: document.querySelector("#tuning-max-concurrent-inserts"),
+  tuningInsertWait: document.querySelector("#tuning-insert-wait"),
+  tuningTimeoutCount: document.querySelector("#tuning-timeout-count"),
+  tuningErrorCount: document.querySelector("#tuning-error-count"),
+  tuningRetryCount: document.querySelector("#tuning-retry-count"),
+  tuningValidationMode: document.querySelector("#tuning-validation-mode"),
+  tuningValidationTimeout: document.querySelector("#tuning-validation-timeout"),
+  tuningDynamicChunks: document.querySelector("#tuning-dynamic-chunks"),
+  tuningChunkCount: document.querySelector("#tuning-chunk-count"),
+  tuningCompletedChunks: document.querySelector("#tuning-completed-chunks"),
+  tuningFailedChunks: document.querySelector("#tuning-failed-chunks"),
+  tuningRecommendations: document.querySelector("#tuning-recommendations"),
   diagnosticsSemantics: document.querySelector("#diagnostics-semantics"),
   diagTotalDuration: document.querySelector("#diag-total-duration"),
   diagOracleCount: document.querySelector("#diag-oracle-count"),
@@ -237,7 +251,7 @@ function renderWorkers(workers) {
   if (!rows.length) {
     const row = document.createElement("tr");
     const cell = document.createElement("td");
-    cell.colSpan = 13;
+    cell.colSpan = 14;
     cell.textContent = "No worker progress yet.";
     row.appendChild(cell);
     elements.workerProgressBody.appendChild(row);
@@ -252,6 +266,7 @@ function renderWorkers(workers) {
     const timings = worker.timings || {};
     const values = [
       worker.worker_id,
+      worker.current_chunk_id ?? "-",
       formatMode(worker.resolved_parallel_mode || worker.partition_mode),
       worker.partition_column || "-",
       rangeText,
@@ -273,6 +288,56 @@ function renderWorkers(workers) {
     }
     elements.workerProgressBody.appendChild(row);
   }
+}
+
+function renderList(element, items, emptyText) {
+  element.replaceChildren();
+  if (!items.length) {
+    const item = document.createElement("li");
+    item.textContent = emptyText;
+    element.appendChild(item);
+    return;
+  }
+  for (const text of items) {
+    const item = document.createElement("li");
+    item.textContent = text;
+    element.appendChild(item);
+  }
+}
+
+function renderInsertTuning(status) {
+  const diagnostics = status.performance_diagnostics || {};
+  elements.tuningInsertBatchSize.textContent = formatNumber(
+    status.clickhouse_insert_batch_size || diagnostics.clickhouse_insert_batch_size,
+  );
+  elements.tuningMaxConcurrentInserts.textContent = formatNumber(
+    status.max_concurrent_clickhouse_inserts || diagnostics.max_concurrent_clickhouse_inserts,
+  );
+  elements.tuningInsertWait.textContent = formatSeconds(
+    status.insert_wait_seconds || diagnostics.insert_wait_seconds,
+  );
+  elements.tuningTimeoutCount.textContent = formatNumber(
+    status.clickhouse_insert_timeout_count || diagnostics.clickhouse_insert_timeout_count,
+  );
+  elements.tuningErrorCount.textContent = formatNumber(
+    status.clickhouse_insert_error_count || diagnostics.clickhouse_insert_error_count,
+  );
+  elements.tuningRetryCount.textContent = formatNumber(
+    status.clickhouse_insert_retries || diagnostics.clickhouse_insert_retries,
+  );
+  elements.tuningValidationMode.textContent = status.validation_mode || diagnostics.validation_mode || "fast";
+  elements.tuningValidationTimeout.textContent = formatSeconds(
+    status.validation_timeout_seconds || diagnostics.validation_timeout_seconds,
+  );
+  elements.tuningDynamicChunks.textContent = status.dynamic_chunks_enabled ? "true" : "false";
+  elements.tuningChunkCount.textContent = formatNumber(status.chunk_count);
+  elements.tuningCompletedChunks.textContent = formatNumber(status.completed_chunk_count);
+  elements.tuningFailedChunks.textContent = formatNumber(status.failed_chunk_count);
+  renderList(
+    elements.tuningRecommendations,
+    Array.isArray(status.recommendations) ? status.recommendations : [],
+    "No recommendations yet.",
+  );
 }
 
 function renderDiagnostics(status) {
@@ -300,18 +365,7 @@ function renderDiagnostics(status) {
   elements.diagMaxWorkerInsert.textContent = formatSeconds(workerSummary.clickhouse_insert_duration_seconds?.max);
 
   const warnings = Array.isArray(status.warnings) ? status.warnings : [];
-  elements.diagnosticsWarnings.replaceChildren();
-  if (!warnings.length) {
-    const item = document.createElement("li");
-    item.textContent = "No warnings.";
-    elements.diagnosticsWarnings.appendChild(item);
-    return;
-  }
-  for (const warning of warnings) {
-    const item = document.createElement("li");
-    item.textContent = warning;
-    elements.diagnosticsWarnings.appendChild(item);
-  }
+  renderList(elements.diagnosticsWarnings, warnings, "No warnings.");
 }
 
 function renderValidation(status) {
@@ -344,13 +398,35 @@ function renderValidation(status) {
     return;
   }
 
+  if (validationStatus === "SKIPPED") {
+    elements.validationSummary.textContent = "Validation skipped by configuration.";
+    if (status.validation_error_message) {
+      elements.validationError.hidden = false;
+      elements.validationError.textContent = status.validation_error_message;
+    }
+    return;
+  }
+
+  if (validationStatus === "TIMEOUT") {
+    elements.validationSummary.textContent = "Validation timed out after the data load completed.";
+    if (status.validation_error_message) {
+      elements.validationError.hidden = false;
+      elements.validationError.textContent = status.validation_error_message;
+    }
+    return;
+  }
+
   elements.validationSummary.textContent = "Validation has not started.";
 }
 
 function setProgress(status) {
   const percent = Math.max(0, Math.min(100, Number(status.progress_percent || 0)));
   elements.progressPanel.hidden = false;
-  elements.jobStatus.textContent = status.status || "PENDING";
+  const validationStatus = status.validation_status || "NOT_STARTED";
+  elements.jobStatus.textContent =
+    status.status === "SUCCESS" && ["FAILED", "TIMEOUT", "SKIPPED"].includes(validationStatus)
+      ? `SUCCESS (${validationStatus})`
+      : status.status || "PENDING";
   elements.progressFill.style.width = `${percent}%`;
   elements.progressPercent.textContent = `${percent.toFixed(1)}%`;
   elements.totalRows.textContent = formatNumber(status.total_rows);
@@ -365,15 +441,18 @@ function setProgress(status) {
   elements.requestedParallelMode.textContent = formatMode(status.requested_parallel_mode);
   elements.resolvedParallelMode.textContent = formatMode(status.resolved_parallel_mode);
   renderDiagnostics(status);
+  renderInsertTuning(status);
   renderValidation(status);
   renderWorkers(status.workers);
 
   if (status.error_message) {
     elements.migrationError.hidden = false;
     elements.migrationError.textContent = status.error_message;
+    elements.timeoutActions.hidden = !String(status.error_message).includes("ClickHouse insert timed out");
   } else {
     elements.migrationError.hidden = true;
     elements.migrationError.textContent = "";
+    elements.timeoutActions.hidden = true;
   }
 }
 

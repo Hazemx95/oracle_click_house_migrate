@@ -25,10 +25,13 @@ def test_compute_numeric_ranges_collapses_equal_bounds_to_one_range() -> None:
     assert ranges[0].inclusive_end is True
 
 
-def test_compute_numeric_ranges_clamps_workers_to_sixteen() -> None:
+def test_compute_numeric_ranges_supports_dynamic_chunk_counts() -> None:
     ranges = compute_numeric_ranges(0, 160, 32)
 
-    assert len(ranges) == 16
+    assert len(ranges) == 32
+    for left, right in zip(ranges, ranges[1:]):
+        assert left.end == right.start
+        assert left.inclusive_end is False
 
 
 def test_compute_numeric_ranges_covers_all_null_partition_values() -> None:

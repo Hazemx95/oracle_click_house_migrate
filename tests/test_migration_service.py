@@ -119,7 +119,7 @@ def test_inline_lob_values_do_not_require_locator_reads() -> None:
     assert batch == [("clob text", "0102")]
 
 
-def test_clickhouse_insert_rows_uses_batch_insert_with_explicit_columns() -> None:
+def test_clickhouse_insert_rows_uses_batch_insert_with_explicit_columns(monkeypatch) -> None:
     class FakeClickHouse:
         def __init__(self) -> None:
             self.calls = []
@@ -128,6 +128,7 @@ def test_clickhouse_insert_rows_uses_batch_insert_with_explicit_columns() -> Non
             self.calls.append(kwargs)
 
     client = FakeClickHouse()
+    monkeypatch.setattr(clickhouse_client, "get_settings", lambda: Settings())
 
     inserted = clickhouse_client.insert_rows(
         "CM__COMPONENT",
@@ -356,13 +357,17 @@ def test_hash_worker_uses_null_safe_hash_predicate(monkeypatch) -> None:
         return 0, 0, 0
 
     monkeypatch.setattr(migration_service, "_copy_batches", fake_copy_batches)
+    work_queue = migration_service.Queue()
+    work_queue.put(migration_service.PartitionRange(0, None, None, False))
 
     migration_service._run_worker(  # noqa: SLF001
         job_id,
         request,
         "CM__COMPONENT",
         ["ID", "CODE"],
-        migration_service.PartitionRange(0, None, None, False),
+        work_queue,
+        migration_service._new_insert_controller(),  # noqa: SLF001
+        0,
     )
 
     assert 'MOD(NVL(ORA_HASH("CODE"), 0), :workers) = :worker_id' in captured["select_sql"]
@@ -403,10 +408,11 @@ def test_run_parallel_aggregates_worker_progress(monkeypatch) -> None:
         ],
     )
 
-    def fake_run_worker(job_id, request, target_table, column_names, partition_range):  # type: ignore[no-untyped-def]
+    def fake_run_worker(job_id, request, target_table, column_names, work_queue, controller, worker_id):  # type: ignore[no-untyped-def]
+        partition_range = work_queue.get_nowait()
         job_service.update_worker(
             job_id,
-            partition_range.worker_id,
+            worker_id,
             status=job_service.JobStatus.SUCCESS,
             processed_rows=50,
             inserted_rows=50,
@@ -465,7 +471,7 @@ def test_run_parallel_reports_actual_range_count_when_fewer_than_requested(monke
 
     assert status is not None
     assert status["requested_workers"] == 8
-    assert status["worker_count"] == 3
+    assert status["worker_count"] == 8
     assert len(status["workers"]) == 3
 
 
@@ -555,3 +561,448 @@ def test_error_message_includes_step_and_redacts_secret(monkeypatch) -> None:
     )
 
     assert message == "oracle_fetch: failed with ***"
+
+
+def test_insert_semaphore_limits_concurrency_and_releases_after_failure(monkeypatch) -> None:
+    settings = Settings(clickhouse_max_concurrent_inserts=1, clickhouse_insert_batch_size=1)
+    monkeypatch.setattr(migration_service, "get_settings", lambda: settings)
+    job_id = job_service.create_job(
+        source_schema="CM",
+        source_table="COMPONENT",
+        target_database=TARGET_DATABASE,
+        target_table="CM__COMPONENT",
+    )
+    controller = migration_service._new_insert_controller()  # noqa: SLF001
+    observed = {"permit_was_held": False}
+
+    class FakeCursor:
+        arraysize = 0
+        prefetchrows = 0
+
+        def __enter__(self):  # type: ignore[no-untyped-def]
+            return self
+
+        def __exit__(self, *args):  # type: ignore[no-untyped-def]
+            return None
+
+        def execute(self, sql, binds):  # type: ignore[no-untyped-def]
+            return None
+
+        def fetchmany(self, size):  # type: ignore[no-untyped-def]
+            if not hasattr(self, "returned"):
+                self.returned = True
+                return [(1,)]
+            return []
+
+    class FakeConnection:
+        def __enter__(self):  # type: ignore[no-untyped-def]
+            return self
+
+        def __exit__(self, *args):  # type: ignore[no-untyped-def]
+            return None
+
+        def cursor(self):  # type: ignore[no-untyped-def]
+            return FakeCursor()
+
+    class FakeClickHouse:
+        def close(self):  # type: ignore[no-untyped-def]
+            return None
+
+    request = migration_service.InitialLoadRequest(
+        source_schema="CM",
+        source_table="COMPONENT",
+        target_schema="CM",
+        target_table="COMPONENT",
+        partition_column=None,
+        workers=1,
+        batch_size=10,
+    )
+
+    def failing_insert_rows(*args, **kwargs):  # type: ignore[no-untyped-def]
+        observed["permit_was_held"] = not controller.semaphore.acquire(blocking=False)
+        raise RuntimeError("insert failed")
+
+    monkeypatch.setattr(migration_service.clickhouse_client, "get_client", lambda: FakeClickHouse())
+    monkeypatch.setattr(migration_service.oracle_client, "get_connection", lambda: FakeConnection())
+    monkeypatch.setattr(migration_service.clickhouse_client, "insert_rows", failing_insert_rows)
+
+    try:
+        migration_service._copy_batches(  # noqa: SLF001
+            select_sql='SELECT "ID" FROM "CM"."COMPONENT"',
+            binds=None,
+            request=request,
+            target_table="CM__COMPONENT",
+            column_names=["ID"],
+            job_id=job_id,
+            controller=controller,
+        )
+    except RuntimeError:
+        pass
+
+    assert observed["permit_was_held"] is True
+    assert controller.semaphore.acquire(blocking=False) is True
+
+
+def test_oracle_batch_splits_into_smaller_clickhouse_chunks(monkeypatch) -> None:
+    rows = [(1,), (2,), (3,), (4,), (5,)]
+    chunks = [chunk for chunk in migration_service._chunk_rows(rows, 2)]  # noqa: SLF001
+
+    assert chunks == [[(1,), (2,)], [(3,), (4,)], [(5,)]]
+
+
+def test_clickhouse_timeout_marks_job_failed_and_skips_validation(monkeypatch) -> None:
+    job_id = job_service.create_job(
+        source_schema="CM",
+        source_table="COMPONENT",
+        target_database=TARGET_DATABASE,
+        target_table="CM__COMPONENT",
+    )
+    job_service.update_job(job_id, status=job_service.JobStatus.RUNNING)
+    called = {"validation": False}
+
+    def timeout_insert(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise clickhouse_client.ClickHouseInsertTimeoutError("timed out")
+
+    monkeypatch.setattr(migration_service.clickhouse_client, "insert_rows", timeout_insert)
+    monkeypatch.setattr(migration_service, "run_validation", lambda job_id: called.__setitem__("validation", True))
+
+    try:
+        migration_service._insert_with_retry(  # noqa: SLF001
+            job_id=job_id,
+            target_table="CM__COMPONENT",
+            insert_chunk=[(1,)],
+            column_names=["ID"],
+            target_database=TARGET_DATABASE,
+            clickhouse=object(),
+        )
+    except clickhouse_client.ClickHouseInsertTimeoutError as exc:
+        migration_service._record_insert_failure(  # noqa: SLF001
+            job_id=job_id,
+            worker_id=0,
+            chunk_id=1,
+            batch_number=1,
+            range_start=1,
+            range_end=2,
+            inserted_rows_before_failure=0,
+            exc=exc,
+        )
+
+    job = job_service.get_job(job_id)
+
+    assert job is not None
+    assert job["status"] == "FAILED"
+    assert job["error_message"] == migration_service.INSERT_TIMEOUT_MESSAGE
+    assert job["insert_failure"]["worker_id"] == 0
+    assert called["validation"] is False
+
+
+def test_cancellation_flag_stops_workers_at_safe_boundary() -> None:
+    controller = migration_service._new_insert_controller()  # noqa: SLF001
+    controller.cancellation.set()
+
+    try:
+        migration_service._raise_if_cancelled(controller)  # noqa: SLF001
+    except RuntimeError as exc:
+        assert "cancelled" in str(exc)
+    else:  # pragma: no cover - defensive assertion
+        raise AssertionError("cancellation flag was not honored")
+
+
+def test_validation_fast_mode_reuses_initial_oracle_count(monkeypatch) -> None:
+    monkeypatch.setattr(migration_service, "get_settings", lambda: Settings(validation_mode="fast"))
+    job_id = job_service.create_job(
+        source_schema="CM",
+        source_table="COMPONENT",
+        target_database=TARGET_DATABASE,
+        target_table="CM__COMPONENT",
+    )
+    job_service.update_job(job_id, status=job_service.JobStatus.RUNNING, total_rows=10)
+    monkeypatch.setattr(migration_service, "count_source", lambda schema, table: (_ for _ in ()).throw(AssertionError("source recounted")))
+    monkeypatch.setattr(migration_service, "count_target", lambda target_table, target_database: 10)
+
+    migration_service.run_validation(job_id)
+
+    assert job_service.get_job(job_id)["validation_status"] == "SUCCESS"
+
+
+def test_validation_strict_mode_recounts_oracle(monkeypatch) -> None:
+    monkeypatch.setattr(migration_service, "get_settings", lambda: Settings(validation_mode="strict"))
+    job_id = job_service.create_job(
+        source_schema="CM",
+        source_table="COMPONENT",
+        target_database=TARGET_DATABASE,
+        target_table="CM__COMPONENT",
+    )
+    called = {"source": 0}
+
+    def count_source(schema, table):  # type: ignore[no-untyped-def]
+        called["source"] += 1
+        return 10
+
+    monkeypatch.setattr(migration_service, "count_source", count_source)
+    monkeypatch.setattr(migration_service, "count_target", lambda target_table, target_database: 10)
+
+    migration_service.run_validation(job_id)
+
+    assert called["source"] == 1
+
+
+def test_validation_none_mode_skips_counts(monkeypatch) -> None:
+    monkeypatch.setattr(migration_service, "get_settings", lambda: Settings(validation_mode="none"))
+    job_id = job_service.create_job(
+        source_schema="CM",
+        source_table="COMPONENT",
+        target_database=TARGET_DATABASE,
+        target_table="CM__COMPONENT",
+    )
+    monkeypatch.setattr(migration_service, "count_source", lambda *args: (_ for _ in ()).throw(AssertionError("source counted")))
+    monkeypatch.setattr(migration_service, "count_target", lambda *args: (_ for _ in ()).throw(AssertionError("target counted")))
+
+    migration_service.run_validation(job_id)
+    job = job_service.get_job(job_id)
+
+    assert job["validation_status"] == "SKIPPED"
+    assert job["count_match"] is None
+
+
+def test_retry_transient_insert_failure_then_success_records_warning_and_backoff(monkeypatch) -> None:
+    monkeypatch.setattr(
+        migration_service,
+        "get_settings",
+        lambda: Settings(
+            clickhouse_insert_retry_attempts=2,
+            clickhouse_insert_retry_backoff_seconds=3,
+        ),
+    )
+    sleeps = []
+    calls = {"count": 0}
+    job_id = job_service.create_job(
+        source_schema="CM",
+        source_table="COMPONENT",
+        target_database=TARGET_DATABASE,
+        target_table="CM__COMPONENT",
+    )
+
+    def flaky_insert(*args, **kwargs):  # type: ignore[no-untyped-def]
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RuntimeError("connection reset by peer")
+        return 1
+
+    monkeypatch.setattr(migration_service.clickhouse_client, "insert_rows", flaky_insert)
+    monkeypatch.setattr(migration_service, "sleep", lambda seconds: sleeps.append(seconds))
+
+    inserted, _wait_seconds, _insert_seconds = migration_service._insert_with_retry(  # noqa: SLF001
+        job_id=job_id,
+        target_table="CM__COMPONENT",
+        insert_chunk=[(1,)],
+        column_names=["ID"],
+        target_database=TARGET_DATABASE,
+        clickhouse=object(),
+    )
+    status = job_service.get_status(job_id)
+
+    assert inserted == 1
+    assert calls["count"] == 2
+    assert sleeps == [3]
+    assert migration_service.INSERT_RETRY_WARNING in status["warnings"]
+    assert status["clickhouse_insert_retries"] == 1.0
+    assert status["clickhouse_insert_error_count"] == 1.0
+
+
+def test_non_transient_insert_error_is_not_retried(monkeypatch) -> None:
+    monkeypatch.setattr(
+        migration_service,
+        "get_settings",
+        lambda: Settings(clickhouse_insert_retry_attempts=2),
+    )
+    calls = {"count": 0}
+    job_id = job_service.create_job(
+        source_schema="CM",
+        source_table="COMPONENT",
+        target_database=TARGET_DATABASE,
+        target_table="CM__COMPONENT",
+    )
+
+    def bad_insert(*args, **kwargs):  # type: ignore[no-untyped-def]
+        calls["count"] += 1
+        raise ValueError("bad row encoding")
+
+    monkeypatch.setattr(migration_service.clickhouse_client, "insert_rows", bad_insert)
+
+    try:
+        migration_service._insert_with_retry(  # noqa: SLF001
+            job_id=job_id,
+            target_table="CM__COMPONENT",
+            insert_chunk=[(1,)],
+            column_names=["ID"],
+            target_database=TARGET_DATABASE,
+            clickhouse=object(),
+        )
+    except ValueError:
+        pass
+    else:  # pragma: no cover - defensive assertion
+        raise AssertionError("non-transient insert error was swallowed")
+
+    assert calls["count"] == 1
+
+
+def test_run_parallel_timeout_cancels_other_workers_and_fails_job(monkeypatch) -> None:
+    job_id = job_service.create_job(
+        source_schema="CM",
+        source_table="COMPONENT",
+        target_database=TARGET_DATABASE,
+        target_table="CM__COMPONENT",
+        partition_column="ID",
+        partition_mode="numeric",
+        worker_count=2,
+        requested_parallel_mode="numeric_range",
+        resolved_parallel_mode="numeric_range",
+    )
+    request = migration_service.InitialLoadRequest(
+        source_schema="CM",
+        source_table="COMPONENT",
+        target_schema="CM",
+        target_table="COMPONENT",
+        partition_column="ID",
+        workers=2,
+        batch_size=100,
+        requested_parallel_mode="numeric_range",
+        resolved_parallel_mode="numeric_range",
+        partition_mode="numeric",
+    )
+
+    class FakeFuture:
+        def __init__(self, exc=None):  # type: ignore[no-untyped-def]
+            self.exc = exc
+
+        def result(self):  # type: ignore[no-untyped-def]
+            if self.exc:
+                raise self.exc
+
+    class ImmediateExecutor:
+        def __init__(self, max_workers):  # type: ignore[no-untyped-def]
+            self.max_workers = max_workers
+
+        def __enter__(self):  # type: ignore[no-untyped-def]
+            return self
+
+        def __exit__(self, *args):  # type: ignore[no-untyped-def]
+            return None
+
+        def submit(self, func, *args):  # type: ignore[no-untyped-def]
+            try:
+                func(*args)
+            except Exception as exc:  # noqa: BLE001 - fake future captures worker failure
+                return FakeFuture(exc)
+            return FakeFuture()
+
+    def timeout_copy_batches(**kwargs):  # type: ignore[no-untyped-def]
+        controller = kwargs["controller"]
+        partition_range = kwargs["partition_range"]
+        if partition_range.worker_id == 0:
+            controller.cancellation.set()
+            exc = clickhouse_client.ClickHouseInsertTimeoutError("timed out")
+            migration_service._record_insert_failure(  # noqa: SLF001
+                job_id=job_id,
+                worker_id=kwargs["worker_id"],
+                chunk_id=partition_range.worker_id,
+                batch_number=1,
+                range_start=partition_range.start,
+                range_end=partition_range.end,
+                inserted_rows_before_failure=0,
+                exc=exc,
+            )
+            raise exc
+        migration_service._raise_if_cancelled(controller)  # noqa: SLF001
+        return 0, 0, 0
+
+    monkeypatch.setattr(
+        migration_service,
+        "_build_worker_ranges",
+        lambda request: [
+            migration_service.PartitionRange(0, 0, 50, False, True),
+            migration_service.PartitionRange(1, 50, 100, True, False),
+        ],
+    )
+    monkeypatch.setattr(migration_service, "_copy_batches", timeout_copy_batches)
+    monkeypatch.setattr(migration_service, "ThreadPoolExecutor", ImmediateExecutor)
+    monkeypatch.setattr(migration_service, "as_completed", lambda futures: futures)
+
+    try:
+        migration_service.run_parallel(job_id, request, "CM__COMPONENT", ["ID"])
+    except RuntimeError:
+        pass
+    else:  # pragma: no cover - defensive assertion
+        raise AssertionError("parallel timeout did not fail the run")
+    status = job_service.get_status(job_id)
+
+    assert status["status"] == "FAILED"
+    assert status["error_message"] == migration_service.INSERT_TIMEOUT_MESSAGE
+    assert status["workers"][0]["status"] == "FAILED"
+    assert status["workers"][1]["status"] == "CANCELLED"
+
+
+def test_validation_timeout_sets_timeout_status(monkeypatch) -> None:
+    monkeypatch.setattr(
+        migration_service,
+        "get_settings",
+        lambda: Settings(validation_mode="fast", validation_timeout_seconds=1),
+    )
+    job_id = job_service.create_job(
+        source_schema="CM",
+        source_table="COMPONENT",
+        target_database=TARGET_DATABASE,
+        target_table="CM__COMPONENT",
+    )
+    job_service.update_job(job_id, status=job_service.JobStatus.RUNNING, total_rows=10)
+    monkeypatch.setattr(migration_service, "_run_validation_counts_with_timeout", lambda *args: None)
+
+    migration_service.run_validation(job_id)
+    status = job_service.get_status(job_id)
+
+    assert status["status"] == "SUCCESS"
+    assert status["validation_status"] == "TIMEOUT"
+    assert status["count_match"] is None
+    assert "validation timed out" in status["warnings"][-1]
+
+
+def test_build_worker_ranges_uses_dynamic_chunk_count_for_numeric_and_date(monkeypatch) -> None:
+    monkeypatch.setattr(
+        migration_service,
+        "get_settings",
+        lambda: Settings(migration_dynamic_chunks_enabled=True, migration_chunks_per_worker=4),
+    )
+    monkeypatch.setattr(migration_service, "_min_max_values", lambda schema, table, column: (0, 120))
+    numeric_request = migration_service.InitialLoadRequest(
+        source_schema="CM",
+        source_table="COMPONENT",
+        target_schema="CM",
+        target_table="COMPONENT",
+        partition_column="ID",
+        workers=3,
+        batch_size=100,
+        partition_mode="numeric",
+        partition_column_scale=0,
+    )
+    date_request = migration_service.InitialLoadRequest(
+        source_schema="CM",
+        source_table="COMPONENT",
+        target_schema="CM",
+        target_table="COMPONENT",
+        partition_column="CREATED_AT",
+        workers=3,
+        batch_size=100,
+        partition_mode="date",
+    )
+    monkeypatch.setattr(
+        migration_service,
+        "_min_max_values",
+        lambda schema, table, column: (0, 120) if column == "ID" else (
+            migration_service.datetime(2026, 1, 1),
+            migration_service.datetime(2026, 1, 13),
+        ),
+    )
+
+    assert len(migration_service._build_worker_ranges(numeric_request)) == 12  # noqa: SLF001
+    assert len(migration_service._build_worker_ranges(date_request)) == 12  # noqa: SLF001
