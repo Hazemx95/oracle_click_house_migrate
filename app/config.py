@@ -2,7 +2,7 @@ import os
 from functools import lru_cache
 
 from dotenv import load_dotenv
-from pydantic import BaseModel
+from pydantic import BaseModel 
 
 TARGET_DATABASE = "oracle_migration_hazem"
 
@@ -46,7 +46,7 @@ def _env_validation_mode(name: str, default: str) -> str:
 
 
 class Settings(BaseModel):
-    clickhouse_host: str = ""
+    clickhouse_host: str = "" 
     clickhouse_port: int = 8123
     clickhouse_user: str = ""
     clickhouse_pass: str = ""
@@ -60,22 +60,22 @@ class Settings(BaseModel):
     p5_qa_oracle_dsn: str = ""
     app_host: str = "0.0.0.0"
     app_port: int = 8000
-    migration_batch_size: int = 50000
+    migration_batch_size: int = 25000
     migration_default_workers: int = 4
     oracle_arraysize: int = 50000
     oracle_prefetchrows: int = 50000
     clickhouse_connect_timeout_seconds: int = 15
-    clickhouse_send_receive_timeout_seconds: int = 900
+    clickhouse_send_receive_timeout_seconds: int = 1800
     clickhouse_insert_timeout_seconds: int = 900
     clickhouse_compress: bool = True
     clickhouse_insert_batch_size: int = 25000
-    clickhouse_max_concurrent_inserts: int = 2
+    clickhouse_max_concurrent_inserts: int = 1
     clickhouse_insert_retry_attempts: int = 0
     clickhouse_insert_retry_backoff_seconds: int = 2
     migration_max_workers: int = 8
     migration_absolute_max_workers: int = 16
     migration_dynamic_chunks_enabled: bool = True
-    migration_chunks_per_worker: int = 16
+    migration_chunks_per_worker: int = 64
     migration_parallel_min_rows: int = 100000
     validation_mode: str = "fast"
     validation_timeout_seconds: int = 600

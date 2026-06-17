@@ -6,4 +6,5 @@ jinja2
 python-multipart
 oracledb
 clickhouse-connect
+pytest
     

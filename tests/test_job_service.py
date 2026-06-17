@@ -18,7 +18,7 @@ def test_create_job_initializes_phase_6_fields() -> None:
     )
 
     job = job_service.get_job(job_id)
-
+    assert job is None
     assert job is not None
     assert job["job_id"] == job_id
     assert job["status"] == "PENDING"
