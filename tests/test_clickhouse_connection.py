@@ -39,13 +39,13 @@ def test_clickhouse_health_runs_connect_and_target_database_queries(
 
     result = clickhouse_client.health()
 
-    assert result == {
-        "status": "success",
-        "database": "clickhouse",
-        "can_connect": True,
-        "target_database": TARGET_DATABASE,
-        "target_database_exists": True,
-    }
+    assert result["status"] == "success"
+    assert result["database"] == "clickhouse"
+    assert result["can_connect"] is True
+    assert result["target_database"] == TARGET_DATABASE
+    assert result["target_database_exists"] is True
+    assert result["effective_timeouts"]["connect_timeout"] == 15
+    assert result["effective_timeouts"]["send_receive_timeout"] == 900
     assert client.queries == [
         "SELECT 1",
         "SELECT name FROM system.databases WHERE name = {database:String}",
@@ -124,6 +124,37 @@ def test_insert_rows_uses_single_batch_insert_call_for_multi_row_batch(monkeypat
     }
 
 
+def test_insert_rows_uses_insert_timeout_for_owned_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = {}
+
+    class InsertClient:
+        def insert(self, **kwargs):  # type: ignore[no-untyped-def]
+            captured["insert"] = kwargs
+
+        def close(self):  # type: ignore[no-untyped-def]
+            captured["closed"] = True
+
+    class FakeClickhouseConnect:
+        @staticmethod
+        def get_client(**kwargs):  # type: ignore[no-untyped-def]
+            captured["client_kwargs"] = kwargs
+            return InsertClient()
+
+    monkeypatch.setattr(clickhouse_client, "clickhouse_connect", FakeClickhouseConnect)
+    monkeypatch.setattr(
+        clickhouse_client,
+        "get_settings",
+        lambda: Settings(clickhouse_send_receive_timeout_seconds=900, clickhouse_insert_timeout_seconds=77),
+    )
+
+    inserted = clickhouse_client.insert_rows("CM__COMPONENT", [(1,)], ["ID"])
+
+    assert inserted == 1
+    assert captured["client_kwargs"]["send_receive_timeout"] == 77
+    assert captured["insert"]["database"] == TARGET_DATABASE
+    assert captured["closed"] is True
+
+
 def test_get_client_receives_timeout_and_compression_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     captured = {}
 
@@ -151,6 +182,16 @@ def test_get_client_receives_timeout_and_compression_settings(monkeypatch: pytes
     assert captured["compress"] is True
 
 
+def test_effective_timeouts_reports_applied_insert_timeout() -> None:
+    timeouts = clickhouse_client.effective_timeouts(
+        Settings(clickhouse_send_receive_timeout_seconds=900, clickhouse_insert_timeout_seconds=77)
+    )
+
+    assert timeouts["send_receive_timeout"] == 900
+    assert timeouts["insert_send_receive_timeout"] == 77
+    assert timeouts["insert_timeout_applied_via"] == "send_receive_timeout"
+
+
 def test_insert_timeout_is_raised_as_safe_typed_error() -> None:
     class TimeoutClient:
         def insert(self, **kwargs):  # type: ignore[no-untyped-def]
@@ -158,6 +199,12 @@ def test_insert_timeout_is_raised_as_safe_typed_error() -> None:
 
     with pytest.raises(clickhouse_client.ClickHouseInsertTimeoutError, match="timed out"):
         clickhouse_client.insert_rows("CM__COMPONENT", [(1,)], ["ID"], client=TimeoutClient())
+
+
+def test_insert_timeout_is_not_transient_for_retry_policy() -> None:
+    assert clickhouse_client.is_transient_connection_error(
+        clickhouse_client.ClickHouseInsertTimeoutError("timed out")
+    ) is False
 
 
 def test_clickhouse_helpers_reject_non_target_database() -> None:

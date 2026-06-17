@@ -54,7 +54,9 @@ def _capability_guarded_kwargs(func: Any, kwargs: dict[str, Any]) -> dict[str, A
 
 
 def is_transient_connection_error(exc: Exception) -> bool:
-    if isinstance(exc, (TimeoutError, socket.timeout, ClickHouseInsertTimeoutError)):
+    if isinstance(exc, ClickHouseInsertTimeoutError):
+        return False
+    if isinstance(exc, (TimeoutError, socket.timeout)):
         return True
     message = str(exc).lower()
     transient_markers = (
@@ -99,6 +101,39 @@ def get_client(settings: Settings | None = None) -> Any:
             "password": settings.clickhouse_pass,
         }
         return clickhouse_connect.get_client(**minimal_kwargs)
+
+
+def get_insert_client(settings: Settings | None = None) -> Any:
+    settings = settings or get_settings()
+    update = {"clickhouse_send_receive_timeout_seconds": settings.clickhouse_insert_timeout_seconds}
+    copy_settings = getattr(settings, "model_copy", None)
+    insert_settings = copy_settings(update=update) if copy_settings else settings.copy(update=update)
+    return get_client(insert_settings)
+
+
+def effective_timeouts(settings: Settings | None = None) -> dict[str, Any]:
+    settings = settings or get_settings()
+    supported: dict[str, Any] = {
+        "connect_timeout": settings.clickhouse_connect_timeout_seconds,
+        "send_receive_timeout": settings.clickhouse_send_receive_timeout_seconds,
+        "insert_send_receive_timeout": settings.clickhouse_insert_timeout_seconds,
+        "insert_timeout_applied_via": "send_receive_timeout",
+        "compress": settings.clickhouse_compress,
+    }
+    if clickhouse_connect is None:
+        return supported
+    kwargs = _capability_guarded_kwargs(
+        clickhouse_connect.get_client,
+        {
+            "connect_timeout": supported["connect_timeout"],
+            "send_receive_timeout": supported["send_receive_timeout"],
+            "compress": supported["compress"],
+        },
+    )
+    supported["connect_timeout_supported"] = "connect_timeout" in kwargs
+    supported["send_receive_timeout_supported"] = "send_receive_timeout" in kwargs
+    supported["compress_supported"] = "compress" in kwargs
+    return supported
 
 
 def _rows(query_result: Any) -> list[Any]:
@@ -209,7 +244,7 @@ def insert_rows(
         return 0
 
     close_client = client is None
-    client = client or get_client()
+    client = client or get_insert_client(settings)
     try:
         insert_kwargs = {
             "table": table,
@@ -237,6 +272,7 @@ def health() -> dict[str, Any]:
         "can_connect": False,
         "target_database": TARGET_DATABASE,
         "target_database_exists": False,
+        "effective_timeouts": effective_timeouts(settings),
     }
 
     client = None

@@ -10,7 +10,9 @@ A Python FastAPI web application that lets an engineer migrate selected Oracle t
 
 **Scope — initial full load only (Phases 4–10).** When the user clicks **Launch / Replicate**, the app performs a full-table **replace**: drop the target ClickHouse table if it exists, create a fresh empty target table from the Oracle→ClickHouse type mapping, extract the full Oracle source table via batch reads, and batch-insert every row. Re-launching the same source schema/table drops and recreates the target and reloads in full, so the target always holds **only the latest full-load result** (never appended duplicate copies). This project does **not** implement CDC, incremental loading, watermark logic, deduplication, merge/upsert, staging-table replacement, append-only duplicate loading, or skip-existing-row logic — CDC and incremental logic are owned by another team. `DROP TABLE` is hereby explicitly authorized (per Constitution Principle II's "later phase" clause) and remains confined to `oracle_migration_hazem`. Business logic lives in framework-agnostic service modules (`app/services/*`, `app/db/*`) so the engine can be imported directly into an existing Flask app; FastAPI route files are thin wrappers only.
 
-The work is delivered **phase by phase** (Phase 0 through Phase 10). Each phase has a goal, scope, files, the code that must exist when it ends, acceptance criteria, manual test commands, and a hard stop point. No phase begins until the prior phase is verified.
+The work is delivered **phase by phase**. Each phase has a goal, scope, files, the code that must exist when it ends, acceptance criteria, manual test commands, and a hard stop point. No phase begins until the prior phase is verified.
+
+**Active scope correction (2026-06-17).** Phases 0–8.2 are implemented. The **final active phase for the current project scope is Phase 8.2.1 — Final Migration Stability, GUI Runtime Tuning, and Performance Acceptance**, which makes large-table migration stable and performant (without changing business behavior), adds per-job GUI runtime tuning that overrides config defaults for one job only, verifies and exposes the ClickHouse timeout configuration, and adds adaptive insert sizing, an insert time budget, and improved dynamic chunking for huge tables. **Phase 9 (Final Docker Compose and Team Run) and Phase 10 (Hardening and Production Readiness) are NOT active in the current scope** — they are owned and handled separately by the user/team. Do not implement Phase 9 or Phase 10 work (Docker/team-run packaging, hardening/production-readiness) as part of this effort; both phases are retained below for reference only and marked **DEFERRED — OUT OF CURRENT SCOPE**.
 
 ## Technical Context
 
@@ -26,7 +28,7 @@ The work is delivered **phase by phase** (Phase 0 through Phase 10). Each phase 
 
 **Project Type**: Web service with server-rendered GUI (single FastAPI app serving JSON APIs + Jinja2 template + static JS/CSS)
 
-**Performance Goals**: Memory bounded by `MIGRATION_BATCH_SIZE` (default 100000 rows) regardless of table size; job id returned within a few seconds of launch; parallel mode measurably faster than single-thread on medium tables. Phase 8.1 adds per-step timing diagnostics and bounded tuning (`ORACLE_ARRAYSIZE`, `ORACLE_PREFETCHROWS`, `CLICKHOUSE_INSERT_BATCH_SIZE` each defaulting to `MIGRATION_BATCH_SIZE`; `MIGRATION_PARALLEL_MIN_ROWS` default 100000) to localize and fix the slow path. Phase 8.2 prevents ClickHouse HTTP insert timeouts on huge tables via env-driven client timeouts/compression (`CLICKHOUSE_CONNECT_TIMEOUT_SECONDS` 15, `CLICKHOUSE_SEND_RECEIVE_TIMEOUT_SECONDS` 900, `CLICKHOUSE_INSERT_TIMEOUT_SECONDS` 900, `CLICKHOUSE_COMPRESS` true), an insert-backpressure semaphore (`CLICKHOUSE_MAX_CONCURRENT_INSERTS` 2, independent of Oracle worker count), safer batch sizing (`CLICKHOUSE_INSERT_BATCH_SIZE` default 25000), worker tuning (`MIGRATION_DEFAULT_WORKERS` 4, `MIGRATION_MAX_WORKERS` 8, hard cap 16), fail-fast insert-timeout handling with default-off retry (`CLICKHOUSE_INSERT_RETRY_ATTEMPTS` 0), and validation options (`VALIDATION_MODE` fast/strict/none, `VALIDATION_TIMEOUT_SECONDS` 600) — all without changing business behavior.
+**Performance Goals**: Memory bounded by `MIGRATION_BATCH_SIZE` (default 100000 rows) regardless of table size; job id returned within a few seconds of launch; parallel mode measurably faster than single-thread on medium tables. Phase 8.1 adds per-step timing diagnostics and bounded tuning (`ORACLE_ARRAYSIZE`, `ORACLE_PREFETCHROWS`, `CLICKHOUSE_INSERT_BATCH_SIZE` each defaulting to `MIGRATION_BATCH_SIZE`; `MIGRATION_PARALLEL_MIN_ROWS` default 100000) to localize and fix the slow path. Phase 8.2 prevents ClickHouse HTTP insert timeouts on huge tables via env-driven client timeouts/compression (`CLICKHOUSE_CONNECT_TIMEOUT_SECONDS` 15, `CLICKHOUSE_SEND_RECEIVE_TIMEOUT_SECONDS` 900, `CLICKHOUSE_INSERT_TIMEOUT_SECONDS` 900, `CLICKHOUSE_COMPRESS` true), an insert-backpressure semaphore (`CLICKHOUSE_MAX_CONCURRENT_INSERTS` 2, independent of Oracle worker count), safer batch sizing (`CLICKHOUSE_INSERT_BATCH_SIZE` default 25000), worker tuning (`MIGRATION_DEFAULT_WORKERS` 4, `MIGRATION_MAX_WORKERS` 8, hard cap 16), fail-fast insert-timeout handling with default-off retry (`CLICKHOUSE_INSERT_RETRY_ATTEMPTS` 0), and validation options (`VALIDATION_MODE` fast/strict/none, `VALIDATION_TIMEOUT_SECONDS` 600) — all without changing business behavior. Phase 8.2.1 (final active phase) makes large-table migration stable and high-performance safely: it adds **per-job GUI runtime tuning** (Oracle fetch batch size, ClickHouse insert batch size, max concurrent ClickHouse inserts, validation mode, optional dynamic chunks per worker) that overrides the `app/config.py`/`.env` defaults **for that one job only** (blank field → default; entered value → override; effective settings stored on the job and returned by `/status`), verifies the ClickHouse timeout config is actually applied to `clickhouse-connect` and exposes the effective timeout values in `/api/health/clickhouse` and `/status`, adds **adaptive insert chunk sizing** (start at the effective insert batch size, shrink future chunks when inserts run slow, never below a configured minimum, surfaced in diagnostics) governed by an **insert time budget** (`CLICKHOUSE_INSERT_TARGET_SECONDS` 30, `CLICKHOUSE_INSERT_SLOW_SECONDS` 45), and improves **dynamic chunking for huge tables** (for `total_rows > 10,000,000`, at least `workers * 64` chunks unless the user/config requests more, preserving no-overlap/no-gap ranges and NUMBER scale-0 integer boundaries). The Phase 8.2 fail-fast insert-timeout safety (worker FAILED → job FAILED → cooperative stop → no validation → target treated as incomplete) is preserved.
 
 **Constraints**: Oracle is read-only (SELECT only); ClickHouse writes only to `oracle_migration_hazem`; credentials from environment variables only, never hardcoded or logged; bind variables for all parameterized Oracle queries; no full-table reads into memory
 
@@ -41,7 +43,7 @@ Evaluated against the project constitution v1.0.0 (`.specify/memory/constitution
 - **I. Oracle read-only (NON-NEGOTIABLE)**: PASS — all Oracle access routes through one read-only client issuing only `SELECT`; a guard rejects any non-read statement.
 - **II. ClickHouse target restricted (NON-NEGOTIABLE)**: PASS — every write goes through a wrapper that forces/validates database `oracle_migration_hazem` and rejects any other. The full-load engine uses `DROP TABLE IF EXISTS`, `CREATE TABLE`, `INSERT INTO`, and `SELECT`, all confined to `oracle_migration_hazem`. `DROP TABLE`/`CREATE TABLE` (drop-and-recreate replace) is the explicitly authorized rerun behavior this plan introduces under Principle II's "later phase" clause; it is never executed against any other database.
 - **III. Environment-based credentials (NON-NEGOTIABLE)**: PASS — config via `.env`/pydantic, `.env.example` placeholders only, `.gitignore` excludes `.env`, no secrets in code/Docker/README/tests.
-- **IV. Phase-based implementation**: PASS — Phases 0–10 each carry scope, files, acceptance criteria, manual test commands, and a stop point.
+- **IV. Phase-based implementation**: PASS — every phase (0 through the final active phase 8.2.1) carries scope, files, acceptance criteria, manual test commands, and a stop point. Phases 9–10 are deferred out of current scope (handled separately by the user/team) and retained for reference only; deferring them does not weaken any non-negotiable guardrail.
 - **V. Memory-safe large-table migration**: PASS — chunked `fetchmany` + ClickHouse batch inserts; parallel mode (Phase 7) added only after single-thread (Phase 6); workers default 8, max 16; range modes guarantee no duplicate/missing rows.
 - **VI. Dynamic, metadata-driven GUI**: PASS — schemas/tables/columns loaded from Oracle metadata; target schema auto-fills; ClickHouse DB fixed/disabled (Phase 4).
 - **VII. Security & safety first (NON-NEGOTIABLE)**: PASS — no secret logging; schema/table/column validated against metadata; bind variables for Oracle queries; no raw input concatenated into SQL.
@@ -761,11 +763,162 @@ pytest tests/test_config.py tests/test_clickhouse_client.py tests/test_migration
 - `none` validation mode skips counting and marks `SKIPPED`.
 - Service modules do not import FastAPI (extend the existing no-FastAPI-import guard test).
 
-**Stop point**: Stop after Phase 8.2 once timeouts are configurable, the insert semaphore bounds concurrency, insert-timeout fails the job fast (no validation, clear GUI message, stored failure record), retries are off by default, the three validation modes work within their timeout, and all new diagnostics appear in the status API and GUI. Then continue Phase 9 (Final Docker Compose and Team Run).
+**Stop point**: Stop after Phase 8.2 once timeouts are configurable, the insert semaphore bounds concurrency, insert-timeout fails the job fast (no validation, clear GUI message, stored failure record), retries are off by default, the three validation modes work within their timeout, and all new diagnostics appear in the status API and GUI. Then continue Phase 8.2.1 (Final Migration Stability, GUI Runtime Tuning, and Performance Acceptance) — the final active phase for the current project scope.
 
 ---
 
-### Phase 9 — Final Docker Compose and Team Run
+### Phase 8.2.1 — Final Migration Stability, GUI Runtime Tuning, and Performance Acceptance **(FINAL ACTIVE PHASE)**
+
+**Goal**: Make the migration engine **stable and high-performance for large tables** while keeping all business behavior unchanged. Performance is non-negotiable in this phase but must be achieved **safely** — no row-by-row insert, no full-table memory load, no unsafe blind retry, no hidden partial-success state, no ignored ClickHouse timeout, no worker failure hidden behind a `SUCCESS` status. This phase adds per-job GUI runtime tuning (overriding config defaults for one job only), verifies and exposes the ClickHouse timeout configuration, adds adaptive insert sizing governed by an insert time budget, improves dynamic chunking for huge tables, and defines the final acceptance target for the current project scope.
+
+**Production problem to eliminate**: a large migration still fails with a ClickHouse insert timeout. Observed example — total rows `76,843,330`, insert batch size `25,000`, max concurrent ClickHouse inserts `2`; the job failed at ~`0.6%` with "ClickHouse insert timed out"; validation correctly did not start; the job was correctly marked `FAILED`. Phase 8.2.1 must let such a table run with conservative settings without timing out, while keeping the fail-fast safety net from Phase 8.2 when a timeout does occur.
+
+**Diagnosis-first principle**: the failure is on the ClickHouse HTTP insert round trip for huge/heavy rows, not on extraction. The levers are (1) the **effective** ClickHouse timeout values actually reaching `clickhouse-connect` (verify, don't assume); (2) insert chunk size that is small enough for heavy rows yet large enough to be efficient — addressed by **adaptive sizing** within an **insert time budget**; (3) chunk count for huge tables so no single worker streams an unbounded slice. The new diagnostics must make the chosen effective settings, the adaptive insert size, the timeout values, and the dynamic chunk count all visible.
+
+**Scope** (do **only** this):
+- Add **per-job GUI runtime tuning** inputs and the backend plumbing to honor them for one job only (override config defaults; blank → default; never persist to `.env`).
+- Validate the tuning inputs and reject invalid values with clear `400`s **before** any job is created.
+- Store the **effective settings** on the job and return them from `GET /api/migrations/{job_id}/status` (and `GET /api/migrations/{job_id}`).
+- **Verify** the ClickHouse timeout config is genuinely applied to `clickhouse-connect`; expose the **effective** timeout values in `/api/health/clickhouse` and on the job `/status`.
+- Add **adaptive insert chunk sizing** with an **insert time budget** and surface the current adaptive size in diagnostics.
+- Improve **dynamic chunking for huge tables** (`total_rows > 10,000,000` → at least `workers * 64` chunks unless the user/config asks for more), preserving no-overlap/no-gap ranges and NUMBER scale-0 integer boundaries.
+- Keep the Phase 8.2 fail-fast insert-timeout safety intact and verified.
+
+**Explicit non-scope (do NOT implement)**: no project rewrite; **no change to business behavior**. Preserved exactly: initial full load only; drop the target ClickHouse table once per job; create the target ClickHouse table once per job; full-load Oracle rows; **no CDC, no incremental, no watermark, no staging table, no merge/upsert, no append-duplicate behavior, no skip-existing rows**; Oracle is read-only and may execute only `SELECT`; ClickHouse writes only to `oracle_migration_hazem`; service modules stay reusable from Flask; FastAPI routes stay thin wrappers. Do **not** implement Phase 9 (Docker/team-run) or Phase 10 (hardening/production-readiness) here. Do **not** auto-increase workers to mask a timeout. The GUI must **not** mutate `.env` or any process-wide default.
+
+**Files to create or update**:
+- `app/config.py` — add the insert time-budget settings and the adaptive-size floor, each env-driven with a default and never hardcoded in service logic:
+  - `CLICKHOUSE_INSERT_TARGET_SECONDS` (default `30`).
+  - `CLICKHOUSE_INSERT_SLOW_SECONDS` (default `45`).
+  - `CLICKHOUSE_INSERT_MIN_BATCH_SIZE` (minimum adaptive insert chunk; default e.g. `1000`, must be ≤ `CLICKHOUSE_INSERT_BATCH_SIZE`). Reconcile the existing `MIGRATION_CHUNKS_PER_WORKER` default (the `Settings` model field default is `64`; `get_settings()` currently reads `16`) so the huge-table rule below has a single, documented source of truth. Validate `CLICKHOUSE_INSERT_SLOW_SECONDS >= CLICKHOUSE_INSERT_TARGET_SECONDS` at config load. Credentials never logged.
+- `app/services/migration_service.py` — add a pure, framework-agnostic **effective-settings resolver** `resolve_effective_settings(overrides, settings)` that merges per-job GUI overrides over the config defaults (blank/None → default; provided → override; clamp `max_concurrent_clickhouse_inserts` to the safe configured ceiling) and returns an immutable per-job settings view used for the **whole** job (cursor `arraysize`/`prefetchrows`, ClickHouse insert chunking, insert semaphore size, validation mode, chunks-per-worker). Add **adaptive insert chunk sizing**: start each job at the effective ClickHouse insert batch size; after each insert, if its duration exceeds the budget, reduce the next chunk size (bounded, e.g. halve toward `CLICKHOUSE_INSERT_MIN_BATCH_SIZE`, never below it); record the **current adaptive insert batch size** and add a warning/recommendation when an insert exceeds `CLICKHOUSE_INSERT_SLOW_SECONDS`. Improve dynamic chunking: when `total_rows > 10,000,000`, compute at least `workers * 64` chunks (or higher if user/config requests it) while keeping half-open ranges (final inclusive), no overlap, no gaps, and integer boundaries for NUMBER scale-0 columns. Keep the module **framework-agnostic (no FastAPI imports)**.
+- `app/db/clickhouse_client.py` — expose the **effective** timeout values actually used to build the client (e.g. an `effective_timeouts()` helper or include them in the `health()` payload) so they can be surfaced; keep the capability-guarded `get_client(...)` and the `ClickHouseInsertTimeoutError` typing. Accept a per-job insert chunk size from the adaptive sizer rather than only the global config value.
+- `app/services/job_service.py` — store an **`effective_settings`** block on the job (the resolved per-job tuning actually in force) and the **current adaptive insert batch size**; extend the `diagnostics` block with the adaptive-size and insert-budget fields below; include them in `get_job`/`get_status`; never store secrets.
+- `app/api/migration_routes.py` — thin wrappers only: extend the `MigrationRequest` model with the optional tuning fields (below), validate them (clear `400` on any invalid value, **no job created**), pass them to `resolve_effective_settings`, and ensure both GET endpoints return `effective_settings` and the new diagnostics. No business logic added here.
+- `app/api/health_routes.py` — `/api/health/clickhouse` additionally returns the **effective** timeout values (`connect_timeout`, `send_receive_timeout`, insert timeout where supported, `compress`) with no credentials.
+- `app/templates/index.html` + `app/static/app.js` — add the optional tuning inputs near **Worker Threads** / **Parallel Mode** / **Partition Column** (see GUI fields below) with helper text that blank = use server default; send them in `POST /api/migrations`; display the returned **effective settings**, the **effective ClickHouse timeout values**, the **current adaptive insert batch size**, the **dynamic chunk count**, and the **validation mode** in the Performance Diagnostics section; keep showing the exact Phase 8.2 insert-timeout message on failure.
+- `.env.example` — add `CLICKHOUSE_INSERT_TARGET_SECONDS`, `CLICKHOUSE_INSERT_SLOW_SECONDS`, `CLICKHOUSE_INSERT_MIN_BATCH_SIZE` (and document the reconciled `MIGRATION_CHUNKS_PER_WORKER`) with defaults only (no secrets).
+- `tests/` — add unit tests (below); keep `tests/test_no_fastapi_imports.py` green.
+
+**GUI runtime tuning fields** (optional inputs near Worker Threads / Parallel Mode / Partition Column):
+| GUI field | API field | Default source | Validation |
+| --- | --- | --- | --- |
+| Oracle Fetch Batch Size | `oracle_fetch_batch_size` | `MIGRATION_BATCH_SIZE` / `ORACLE_ARRAYSIZE`/`ORACLE_PREFETCHROWS` | positive integer |
+| ClickHouse Insert Batch Size | `clickhouse_insert_batch_size` | `CLICKHOUSE_INSERT_BATCH_SIZE` | positive integer |
+| Max Concurrent ClickHouse Inserts | `max_concurrent_clickhouse_inserts` | `CLICKHOUSE_MAX_CONCURRENT_INSERTS` | positive integer, **must not exceed the safe configured ceiling** |
+| Validation Mode | `validation_mode` | `VALIDATION_MODE` | one of `fast`, `strict`, `none` |
+| Dynamic Chunks Per Worker (optional) | `dynamic_chunks_per_worker` | `MIGRATION_CHUNKS_PER_WORKER` | positive integer if provided |
+
+**Priority rule (per-job override, never global)**:
+- If a tuning field is left **blank**, use the default value from `app/config.py` / `.env`.
+- If the user enters a value, that value **overrides the default for this job only**; the user GUI value has priority over the default config.
+- The override is stored on the job and returned from `/status` as **effective settings**.
+- The GUI must **not** permanently change `.env` or any process-wide config; overrides live only on the job.
+
+**GUI-tuning validation rules** (enforced **before** job launch — invalid input → clear `400`, **no job created**):
+- Oracle Fetch Batch Size must be a positive integer.
+- ClickHouse Insert Batch Size must be a positive integer.
+- Max Concurrent ClickHouse Inserts must be a positive integer **and must not exceed the safe configured limit** (`CLICKHOUSE_MAX_CONCURRENT_INSERTS` ceiling / a documented safe max).
+- Dynamic Chunks Per Worker must be a positive integer **if provided**.
+- Validation Mode must be `fast`, `strict`, or `none`.
+
+**Performance-stability requirements**:
+- **Verify timeout config is really applied** to `clickhouse-connect` (connect / send-receive / insert timeout where supported, compress) and **expose the effective values** in `/api/health/clickhouse` and on `/status`.
+- **Adaptive insert chunk sizing**: start from the effective ClickHouse insert batch size; reduce the future insert chunk size when insert chunks are slow; never go below `CLICKHOUSE_INSERT_MIN_BATCH_SIZE`; expose the current adaptive insert batch size in diagnostics.
+- **Insert time budget**: `CLICKHOUSE_INSERT_TARGET_SECONDS` (default `30`) and `CLICKHOUSE_INSERT_SLOW_SECONDS` (default `45`); if an insert duration exceeds the slow threshold, add a warning/recommendation (e.g. reduce batch size or insert concurrency).
+- **Dynamic chunking for huge tables**: for `total_rows > 10,000,000`, use at least `workers * 64` chunks unless the user/config requests higher; keep no-overlap/no-gap ranges; keep NUMBER scale-0 integer boundaries.
+- **Keep timeout failure safe** (unchanged from Phase 8.2, re-verified here): on a ClickHouse insert timeout → worker `FAILED`; job `FAILED`; cancellation/stop flag set; other workers stop at a safe batch boundary; validation does not start; target table treated as incomplete; exact GUI message: `"ClickHouse insert timed out. Target table may be incomplete. Re-run migration after reducing batch size or worker concurrency."`
+
+**Diagnostics added (job `diagnostics` block)** — returned from both GET endpoints and shown in the GUI; no secrets:
+- `effective_settings` — the resolved per-job tuning actually in force (oracle fetch batch size, clickhouse insert batch size, max concurrent clickhouse inserts, validation mode, dynamic chunks per worker) and whether each came from a GUI override or a config default.
+- `effective_clickhouse_timeouts` — `connect_timeout`, `send_receive_timeout`, insert timeout (where supported), `compress` actually applied to the client.
+- `clickhouse_insert_batch_size_current` — the **current adaptive** insert chunk size.
+- `clickhouse_insert_batch_size_initial` — the effective starting insert chunk size for the job.
+- `insert_target_seconds` / `insert_slow_seconds` — the configured insert time budget.
+- `slow_insert_count` — number of inserts that exceeded `CLICKHOUSE_INSERT_SLOW_SECONDS`.
+- `dynamic_chunk_count` — total chunks the job split the source into (visible for huge-table runs).
+- Existing Phase 8.1/8.2 diagnostics remain.
+
+**Code that must exist after the phase**:
+- `POST /api/migrations` accepts the optional tuning fields, validates them (clear `400`, no job on failure), and `resolve_effective_settings(...)` merges overrides over config defaults for that one job (GUI value wins; blank → default; `max_concurrent_clickhouse_inserts` clamped to the safe ceiling), free of FastAPI coupling.
+- The job stores and `/status` (+ the full record) return `effective_settings`, the effective ClickHouse timeout values, the current adaptive insert batch size, the insert time-budget values, `slow_insert_count`, and `dynamic_chunk_count`.
+- `/api/health/clickhouse` returns the effective timeout values (no credentials).
+- Adaptive insert sizing starts at the effective insert batch size, shrinks on slow inserts (never below `CLICKHOUSE_INSERT_MIN_BATCH_SIZE`), and emits a warning/recommendation past the slow threshold.
+- Huge tables (`total_rows > 10,000,000`) split into ≥ `workers * 64` chunks (or higher on request) with no overlap, no gaps, and integer NUMBER scale-0 boundaries.
+- The Phase 8.2 fail-fast insert-timeout path still fires (worker FAILED → job FAILED → cooperative stop → no validation → incomplete target → exact GUI message) and is covered by a test.
+- Service modules remain framework-agnostic and reusable from Flask; routes remain thin wrappers; no secrets in logs, job records, or diagnostics.
+
+**Acceptance criteria — the phase is complete only when**:
+- Small table migration succeeds.
+- Medium table migration succeeds.
+- Large table migration can run with conservative settings **without** a ClickHouse timeout.
+- GUI overrides are honored (per job only; `.env` unchanged).
+- Defaults are used when GUI fields are blank.
+- `/status` shows the effective tuning values.
+- The ClickHouse timeout config is visible (in `/api/health/clickhouse` and `/status`).
+- The adaptive insert size is visible in diagnostics.
+- The dynamic chunk count is visible.
+- Validation `fast` mode works (and `strict`/`none` still behave per Phase 8.2).
+- No secrets are logged.
+- Oracle remains read-only (SELECT only).
+- ClickHouse writes remain restricted to `oracle_migration_hazem`.
+- Invalid GUI tuning values return clear `400`s and create no job.
+
+**Constitution gate (P-I, P-II, P-V, P-VII)**: the new tuning, adaptive sizing, time budget, and chunking only wrap existing operations — Oracle stays read-only (only `SELECT`; metadata reads use bind variables); ClickHouse writes stay confined to `oracle_migration_hazem` (unchanged single DROP/CREATE pair + INSERTs); extraction still uses tuned `arraysize`/`prefetchrows` + `fetchmany` + true batch insert (no full-table load, no `fetchall` of source data, no row-by-row insert) and adaptive sizing only **reduces** chunk size — never row-by-row; all new settings come from environment variables and per-job GUI overrides that never mutate `.env`; effective-settings, timeout values, diagnostics, and logs carry **no secrets** (reuse `_safe_error_message` redaction); the fail-fast-on-timeout default plus drop-and-recreate-on-restart keeps the no-blind-retry / no-hidden-partial-success guarantees.
+
+**Manual test commands**:
+```bash
+# Per-job GUI override: smaller insert batch + lower insert concurrency for a huge table, no .env change
+JOB=$(curl -s -X POST http://localhost:8000/api/migrations \
+  -H 'Content-Type: application/json' \
+  -d '{"source_schema":"CM","source_table":"BIG_TABLE","target_table":"CM__BIG_TABLE","workers":4,"partition_column":"ID","parallel_mode":"numeric_range","oracle_fetch_batch_size":50000,"clickhouse_insert_batch_size":10000,"max_concurrent_clickhouse_inserts":2,"validation_mode":"fast","dynamic_chunks_per_worker":64}' \
+  | python -c "import sys,json;print(json.load(sys.stdin)['job_id'])")
+
+# Effective settings, effective timeouts, adaptive insert size, and dynamic chunk count are visible
+curl -s http://localhost:8000/api/migrations/$JOB/status | python -m json.tool   # effective_settings, effective_clickhouse_timeouts, clickhouse_insert_batch_size_current, dynamic_chunk_count, slow_insert_count
+
+# ClickHouse timeout config is visible on health
+curl -s http://localhost:8000/api/health/clickhouse | python -m json.tool   # connect/send_receive/insert timeout + compress, no credentials
+
+# Invalid tuning is rejected before any job is created (clear 400, no job)
+curl -i -X POST http://localhost:8000/api/migrations \
+  -H 'Content-Type: application/json' \
+  -d '{"source_schema":"CM","source_table":"COMPONENT","target_table":"CM__COMPONENT","clickhouse_insert_batch_size":-5}'           # 400
+curl -i -X POST http://localhost:8000/api/migrations \
+  -H 'Content-Type: application/json' \
+  -d '{"source_schema":"CM","source_table":"COMPONENT","target_table":"CM__COMPONENT","validation_mode":"loose"}'                    # 400
+curl -i -X POST http://localhost:8000/api/migrations \
+  -H 'Content-Type: application/json' \
+  -d '{"source_schema":"CM","source_table":"COMPONENT","target_table":"CM__COMPONENT","max_concurrent_clickhouse_inserts":9999}'      # 400 (exceeds safe ceiling)
+
+# Blank fields fall back to config defaults (effective_settings shows source = default)
+curl -s -X POST http://localhost:8000/api/migrations \
+  -H 'Content-Type: application/json' \
+  -d '{"source_schema":"CM","source_table":"COMPONENT","target_table":"CM__COMPONENT","workers":1}' >/dev/null
+
+# No secret leakage while timeouts/adaptive sizing/diagnostics are logged
+docker logs oracle-clickhouse-migration-app | grep -Ei "password|passwd|secret" && echo "ERROR: secret in logs" || echo "logs clean"
+pytest tests/test_config.py tests/test_clickhouse_client.py tests/test_migration_service.py tests/test_job_service.py tests/test_no_fastapi_imports.py
+```
+
+**Add tests**:
+- Config parses `CLICKHOUSE_INSERT_TARGET_SECONDS`, `CLICKHOUSE_INSERT_SLOW_SECONDS`, `CLICKHOUSE_INSERT_MIN_BATCH_SIZE`, and rejects `CLICKHOUSE_INSERT_SLOW_SECONDS < CLICKHOUSE_INSERT_TARGET_SECONDS`.
+- `resolve_effective_settings` applies GUI overrides over defaults (override wins; blank → default; `max_concurrent_clickhouse_inserts` clamped to the safe ceiling).
+- GUI-tuning validation rejects non-positive batch sizes, out-of-range insert concurrency, a non-`fast/strict/none` validation mode, and a non-positive dynamic-chunks value — each as a pre-launch `400` with no job created.
+- Adaptive insert sizing reduces the next chunk size after a slow insert and never drops below `CLICKHOUSE_INSERT_MIN_BATCH_SIZE`; `slow_insert_count` increments past the slow threshold.
+- Huge-table chunking (`total_rows > 10,000,000`) produces ≥ `workers * 64` chunks with no overlap, no gaps, and integer NUMBER scale-0 boundaries.
+- The ClickHouse client receives the configured timeouts and `effective_clickhouse_timeouts` reflects them.
+- An insert timeout still marks the worker and job `FAILED` and skips validation (Phase 8.2 safety preserved).
+- The effective settings appear on the job `/status` output.
+- Service modules do not import FastAPI.
+
+**Stop point**: Stop after Phase 8.2.1 — the **final active phase** for the current project scope — once small/medium tables migrate successfully, a large table runs with conservative settings without a ClickHouse timeout, GUI overrides are honored per job (with defaults on blank), `/status` shows effective tuning values, the ClickHouse timeout config and adaptive insert size and dynamic chunk count are all visible, `fast` validation works, no secrets are logged, Oracle stays read-only, and ClickHouse writes stay confined to `oracle_migration_hazem`. **Phases 9 and 10 are deferred out of current scope** (handled separately by the user/team) — do not begin them.
+
+---
+
+### Phase 9 — Final Docker Compose and Team Run **(DEFERRED — OUT OF CURRENT SCOPE)**
+
+> **DEFERRED (2026-06-17).** Phase 9 is **not** an active phase in the current project scope. Docker/team-run packaging is owned and handled separately by the user/team. Do **not** implement it as part of this effort. The content below is retained for reference only; the final active phase is **Phase 8.2.1**.
 
 **Goal**: Make the project easy for a teammate/manager to run from a fresh clone.
 
@@ -797,7 +950,9 @@ grep -rEi "password|passwd|secret" Dockerfile docker-compose.yml README.md   # e
 
 ---
 
-### Phase 10 — Hardening and Production Readiness
+### Phase 10 — Hardening and Production Readiness **(DEFERRED — OUT OF CURRENT SCOPE)**
+
+> **DEFERRED (2026-06-17).** Phase 10 is **not** an active phase in the current project scope. Hardening/production-readiness work is owned and handled separately by the user/team. Do **not** implement it as part of this effort. The content below is retained for reference only; the final active phase is **Phase 8.2.1**.
 
 **Goal**: Prepare for controlled production/UAT use.
 

@@ -11,6 +11,11 @@ const elements = {
   clickhouseDatabase: document.querySelector("#clickhouse-database"),
   targetTable: document.querySelector("#target-table"),
   workerThreads: document.querySelector("#worker-threads"),
+  oracleFetchBatchSize: document.querySelector("#oracle-fetch-batch-size"),
+  clickhouseInsertBatchSize: document.querySelector("#clickhouse-insert-batch-size"),
+  maxConcurrentClickhouseInserts: document.querySelector("#max-concurrent-clickhouse-inserts"),
+  validationMode: document.querySelector("#validation-mode"),
+  dynamicChunksPerWorker: document.querySelector("#dynamic-chunks-per-worker"),
   launchButton: document.querySelector("#launch-button"),
   launchMessage: document.querySelector("#launch-message"),
   progressPanel: document.querySelector("#migration-progress"),
@@ -38,9 +43,14 @@ const elements = {
   tuningValidationMode: document.querySelector("#tuning-validation-mode"),
   tuningValidationTimeout: document.querySelector("#tuning-validation-timeout"),
   tuningDynamicChunks: document.querySelector("#tuning-dynamic-chunks"),
+  tuningOracleFetchBatch: document.querySelector("#tuning-oracle-fetch-batch"),
+  tuningAdaptiveInsertBatch: document.querySelector("#tuning-adaptive-insert-batch"),
+  tuningConnectTimeout: document.querySelector("#tuning-connect-timeout"),
+  tuningSendReceiveTimeout: document.querySelector("#tuning-send-receive-timeout"),
   tuningChunkCount: document.querySelector("#tuning-chunk-count"),
   tuningCompletedChunks: document.querySelector("#tuning-completed-chunks"),
   tuningFailedChunks: document.querySelector("#tuning-failed-chunks"),
+  tuningSkewRatio: document.querySelector("#tuning-skew-ratio"),
   tuningRecommendations: document.querySelector("#tuning-recommendations"),
   diagnosticsSemantics: document.querySelector("#diagnostics-semantics"),
   diagTotalDuration: document.querySelector("#diag-total-duration"),
@@ -307,11 +317,13 @@ function renderList(element, items, emptyText) {
 
 function renderInsertTuning(status) {
   const diagnostics = status.performance_diagnostics || {};
+  const effective = status.effective_settings || {};
+  const timeouts = diagnostics.effective_clickhouse_timeouts || {};
   elements.tuningInsertBatchSize.textContent = formatNumber(
-    status.clickhouse_insert_batch_size || diagnostics.clickhouse_insert_batch_size,
+    effective.effective_clickhouse_insert_batch_size || status.clickhouse_insert_batch_size || diagnostics.clickhouse_insert_batch_size,
   );
   elements.tuningMaxConcurrentInserts.textContent = formatNumber(
-    status.max_concurrent_clickhouse_inserts || diagnostics.max_concurrent_clickhouse_inserts,
+    effective.effective_max_concurrent_clickhouse_inserts || status.max_concurrent_clickhouse_inserts || diagnostics.max_concurrent_clickhouse_inserts,
   );
   elements.tuningInsertWait.textContent = formatSeconds(
     status.insert_wait_seconds || diagnostics.insert_wait_seconds,
@@ -325,19 +337,33 @@ function renderInsertTuning(status) {
   elements.tuningRetryCount.textContent = formatNumber(
     status.clickhouse_insert_retries || diagnostics.clickhouse_insert_retries,
   );
-  elements.tuningValidationMode.textContent = status.validation_mode || diagnostics.validation_mode || "fast";
+  elements.tuningValidationMode.textContent = effective.effective_validation_mode || status.validation_mode || diagnostics.validation_mode || "fast";
   elements.tuningValidationTimeout.textContent = formatSeconds(
     status.validation_timeout_seconds || diagnostics.validation_timeout_seconds,
   );
   elements.tuningDynamicChunks.textContent = status.dynamic_chunks_enabled ? "true" : "false";
+  elements.tuningOracleFetchBatch.textContent = formatNumber(effective.effective_oracle_fetch_batch_size || diagnostics.oracle_fetch_batch_size);
+  elements.tuningAdaptiveInsertBatch.textContent = formatNumber(
+    effective.current_adaptive_insert_batch_size || status.current_adaptive_insert_batch_size || diagnostics.current_adaptive_insert_batch_size || diagnostics.clickhouse_insert_batch_size_current,
+  );
+  elements.tuningConnectTimeout.textContent = formatSeconds(effective.effective_clickhouse_connect_timeout_seconds || timeouts.connect_timeout);
+  elements.tuningSendReceiveTimeout.textContent = formatSeconds(effective.effective_clickhouse_send_receive_timeout_seconds || timeouts.send_receive_timeout);
   elements.tuningChunkCount.textContent = formatNumber(status.chunk_count);
   elements.tuningCompletedChunks.textContent = formatNumber(status.completed_chunk_count);
   elements.tuningFailedChunks.textContent = formatNumber(status.failed_chunk_count);
+  elements.tuningSkewRatio.textContent = diagnostics.skew_ratio ?? status.skew_ratio ?? "-";
   renderList(
     elements.tuningRecommendations,
     Array.isArray(status.recommendations) ? status.recommendations : [],
     "No recommendations yet.",
   );
+}
+
+function addOptionalNumber(payload, key, element) {
+  const value = element.value.trim();
+  if (value) {
+    payload[key] = Number(value);
+  }
 }
 
 function renderDiagnostics(status) {
@@ -540,6 +566,13 @@ async function onLaunchClick() {
     parallel_mode: elements.parallelMode.value || "auto",
     workers: Number(elements.workerThreads.value || 1),
   };
+  addOptionalNumber(payload, "oracle_fetch_batch_size", elements.oracleFetchBatchSize);
+  addOptionalNumber(payload, "clickhouse_insert_batch_size", elements.clickhouseInsertBatchSize);
+  addOptionalNumber(payload, "max_concurrent_clickhouse_inserts", elements.maxConcurrentClickhouseInserts);
+  addOptionalNumber(payload, "dynamic_chunks_per_worker", elements.dynamicChunksPerWorker);
+  if (elements.validationMode.value) {
+    payload.validation_mode = elements.validationMode.value;
+  }
 
   try {
     elements.launchButton.disabled = true;

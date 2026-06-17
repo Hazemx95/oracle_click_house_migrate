@@ -73,6 +73,7 @@ A unit of background migration work.
 - Per-worker progress (Phase 7): `workers` — list of Worker progress entries (see Worker below)
 - Validation fields (Phase 8): `source_row_count`, `target_row_count`, `count_match` (bool or null), `validation_status` (enum: `NOT_STARTED` | `RUNNING` | `SUCCESS` | `FAILED`), `validation_error_message` (string, nullable)
 - Diagnostics (Phase 8.1): `diagnostics` — performance timing breakdown for the job (see Diagnostics below)
+- Effective settings (Phase 8.2.1): `effective_settings` — the per-job runtime tuning actually in force after merging GUI overrides over config defaults (see EffectiveSettings below). Stored on the job and returned by both GET endpoints. GUI overrides apply to **this job only** and never mutate `.env` or any process-wide default.
 
 ## Diagnostics (embedded in MigrationJob, Phase 8.1)
 Per-step performance instrumentation; all durations in seconds measured with a monotonic clock. Added to localize the slow path before optimizing. Contains no secrets and no raw row/LOB data.
@@ -91,6 +92,24 @@ Per-step performance instrumentation; all durations in seconds measured with a m
 - `avg_seconds_per_batch` (number) — sum of batch durations / `batch_count`.
 - `warnings` (list of string) — heavy columns present (CLOB/NCLOB/BLOB/LONG/RAW); non-indexed range column; small-table single-worker downgrade; etc.
 - `per_worker` (list, parallel mode) — each entry: `worker_id`, `query_execute_seconds`, `fetch_seconds`, `convert_seconds`, `insert_seconds`, `batch_count`, `avg_seconds_per_batch`.
+
+### Diagnostics additions (Phase 8.2.1)
+Added to make large-table stability and the chosen per-job tuning visible; no secrets.
+- `effective_clickhouse_timeouts` (object) — the `connect_timeout`, `send_receive_timeout`, insert timeout (where supported), and `compress` actually applied to the `clickhouse-connect` client.
+- `clickhouse_insert_batch_size_initial` (int) — effective starting ClickHouse insert chunk size for the job.
+- `clickhouse_insert_batch_size_current` (int) — current **adaptive** ClickHouse insert chunk size (shrinks when inserts exceed the time budget, never below `CLICKHOUSE_INSERT_MIN_BATCH_SIZE`).
+- `insert_target_seconds` / `insert_slow_seconds` (number) — the configured insert time budget (`CLICKHOUSE_INSERT_TARGET_SECONDS` default 30 / `CLICKHOUSE_INSERT_SLOW_SECONDS` default 45).
+- `slow_insert_count` (int) — number of inserts whose duration exceeded `insert_slow_seconds`.
+- `dynamic_chunk_count` (int) — total chunks the source was split into; for `total_rows > 10,000,000` this is at least `workers * 64` unless a higher value was requested.
+
+## EffectiveSettings (embedded in MigrationJob, Phase 8.2.1)
+The resolved per-job runtime tuning, produced by merging optional GUI overrides over the `app/config.py`/`.env` defaults. Blank/omitted field → config default; provided value → override (override wins, for this job only). Each field also records its source (`override` | `default`).
+- `oracle_fetch_batch_size` (int) — drives cursor `arraysize`/`prefetchrows`; defaults from `MIGRATION_BATCH_SIZE`/`ORACLE_ARRAYSIZE`/`ORACLE_PREFETCHROWS`.
+- `clickhouse_insert_batch_size` (int) — starting insert chunk size; defaults from `CLICKHOUSE_INSERT_BATCH_SIZE`.
+- `max_concurrent_clickhouse_inserts` (int) — insert semaphore size; defaults from `CLICKHOUSE_MAX_CONCURRENT_INSERTS`; **clamped to the safe configured ceiling**.
+- `validation_mode` (enum `fast` | `strict` | `none`) — defaults from `VALIDATION_MODE`.
+- `dynamic_chunks_per_worker` (int, optional) — defaults from `MIGRATION_CHUNKS_PER_WORKER`.
+- **Validation** (pre-launch; invalid → `400`, no job created): batch sizes and insert concurrency must be positive integers; `max_concurrent_clickhouse_inserts` must not exceed the safe ceiling; `dynamic_chunks_per_worker` must be a positive integer if provided; `validation_mode` must be one of `fast`/`strict`/`none`.
 
 ### State transitions
 ```

@@ -79,6 +79,37 @@
                   For huge tables, start with a stable baseline: multiple Oracle workers, smaller ClickHouse insert chunks, and limited concurrent ClickHouse inserts. Increase workers or insert concurrency only after diagnostics show ClickHouse is stable.
                 </span>
               </label>
+
+              <label for="oracle-fetch-batch-size">
+                Oracle Fetch Batch Size
+                <input id="oracle-fetch-batch-size" name="oracle_fetch_batch_size" type="number" min="1" placeholder="Use config default">
+              </label>
+
+              <label for="clickhouse-insert-batch-size">
+                ClickHouse Insert Batch Size
+                <input id="clickhouse-insert-batch-size" name="clickhouse_insert_batch_size" type="number" min="1" placeholder="Use config default">
+              </label>
+
+              <label for="max-concurrent-clickhouse-inserts">
+                Max Concurrent ClickHouse Inserts
+                <input id="max-concurrent-clickhouse-inserts" name="max_concurrent_clickhouse_inserts" type="number" min="1" placeholder="Use config default">
+              </label>
+
+              <label for="validation-mode">
+                Validation Mode
+                <select id="validation-mode" name="validation_mode">
+                  <option value="" selected>Use config default</option>
+                  <option value="fast">Fast</option>
+                  <option value="strict">Strict</option>
+                  <option value="none">None</option>
+                </select>
+              </label>
+
+              <label for="dynamic-chunks-per-worker">
+                Dynamic Chunks Per Worker
+                <input id="dynamic-chunks-per-worker" name="dynamic_chunks_per_worker" type="number" min="1" placeholder="Use config default">
+                <span class="field-help">Leave blank to use default config. Values entered here override defaults for this job only.</span>
+              </label>
             </div>
           </fieldset>
 
@@ -217,6 +248,22 @@
                 <dd id="tuning-dynamic-chunks">false</dd>
               </div>
               <div>
+                <dt>Oracle Fetch Batch</dt>
+                <dd id="tuning-oracle-fetch-batch">0</dd>
+              </div>
+              <div>
+                <dt>Adaptive Insert Batch</dt>
+                <dd id="tuning-adaptive-insert-batch">0</dd>
+              </div>
+              <div>
+                <dt>Connect Timeout</dt>
+                <dd id="tuning-connect-timeout">0s</dd>
+              </div>
+              <div>
+                <dt>Send/Receive Timeout</dt>
+                <dd id="tuning-send-receive-timeout">0s</dd>
+              </div>
+              <div>
                 <dt>Chunk Count</dt>
                 <dd id="tuning-chunk-count">0</dd>
               </div>
@@ -227,6 +274,10 @@
               <div>
                 <dt>Failed Chunks</dt>
                 <dd id="tuning-failed-chunks">0</dd>
+              </div>
+              <div>
+                <dt>Skew Ratio</dt>
+                <dd id="tuning-skew-ratio">-</dd>
               </div>
             </dl>
             <div class="warnings-panel">

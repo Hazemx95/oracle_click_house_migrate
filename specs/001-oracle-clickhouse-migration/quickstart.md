@@ -104,7 +104,45 @@ docker logs oracle-clickhouse-migration-app | grep -Ei "password|passwd|secret" 
 pytest tests/test_migration_service.py tests/test_job_service.py
 ```
 
-### Phase 9 — team run (fresh clone)
+### Phase 8.2 — ClickHouse insert timeout, backpressure, validation modes
+```bash
+# Backpressure: many Oracle workers, few concurrent ClickHouse inserts
+curl -s -X POST http://localhost:8000/api/migrations \
+  -H 'Content-Type: application/json' \
+  -d '{"source_schema":"CM","source_table":"COMPONENT","target_table":"CM__COMPONENT","workers":8,"partition_column":"ID","parallel_mode":"auto"}'
+curl -s http://localhost:8000/api/migrations/$JOB/status | python -m json.tool   # clickhouse_insert_*, max_concurrent_clickhouse_inserts, insert_concurrency_wait_seconds, validation_mode
+pytest tests/test_config.py tests/test_clickhouse_client.py tests/test_migration_service.py tests/test_job_service.py tests/test_no_fastapi_imports.py
+```
+
+### Phase 8.2.1 — final stability, GUI runtime tuning, performance acceptance (FINAL ACTIVE PHASE)
+```bash
+# Per-job GUI override (this job only; .env untouched). Blank fields fall back to config defaults.
+JOB=$(curl -s -X POST http://localhost:8000/api/migrations \
+  -H 'Content-Type: application/json' \
+  -d '{"source_schema":"CM","source_table":"BIG_TABLE","target_table":"CM__BIG_TABLE","workers":4,"partition_column":"ID","parallel_mode":"numeric_range","oracle_fetch_batch_size":50000,"clickhouse_insert_batch_size":10000,"max_concurrent_clickhouse_inserts":2,"validation_mode":"fast","dynamic_chunks_per_worker":64}' \
+  | python -c "import sys,json;print(json.load(sys.stdin)['job_id'])")
+
+# Effective tuning, effective ClickHouse timeouts, adaptive insert size, and dynamic chunk count are all visible
+curl -s http://localhost:8000/api/migrations/$JOB/status | python -m json.tool
+#   expect effective_settings{...}, diagnostics.effective_clickhouse_timeouts,
+#   diagnostics.clickhouse_insert_batch_size_current, diagnostics.dynamic_chunk_count, diagnostics.slow_insert_count
+
+# Timeout config visible on health
+curl -s http://localhost:8000/api/health/clickhouse | python -m json.tool   # effective_timeouts, no credentials
+
+# Invalid tuning rejected BEFORE any job is created (clear 400, no job)
+curl -i -X POST http://localhost:8000/api/migrations -H 'Content-Type: application/json' \
+  -d '{"source_schema":"CM","source_table":"COMPONENT","target_table":"CM__COMPONENT","clickhouse_insert_batch_size":-5}'        # 400
+curl -i -X POST http://localhost:8000/api/migrations -H 'Content-Type: application/json' \
+  -d '{"source_schema":"CM","source_table":"COMPONENT","target_table":"CM__COMPONENT","validation_mode":"loose"}'                 # 400
+
+# Acceptance: small + medium succeed; a large table runs with conservative settings without a ClickHouse timeout
+docker logs oracle-clickhouse-migration-app | grep -Ei "password|passwd|secret" && echo "ERROR: secret in logs" || echo "logs clean"
+pytest tests/test_config.py tests/test_clickhouse_client.py tests/test_migration_service.py tests/test_job_service.py tests/test_no_fastapi_imports.py
+```
+
+### Phase 9 — team run (fresh clone) — DEFERRED, OUT OF CURRENT SCOPE
+Owned/handled separately by the user/team; not validated as part of the current scope.
 ```bash
 cp .env.example .env && $EDITOR .env
 docker compose up -d --build
@@ -113,7 +151,8 @@ curl http://localhost:8000/api/health/oracle
 curl http://localhost:8000/api/health/clickhouse
 ```
 
-### Phase 10 — hardening
+### Phase 10 — hardening — DEFERRED, OUT OF CURRENT SCOPE
+Owned/handled separately by the user/team; not validated as part of the current scope.
 ```bash
 curl -i http://localhost:8000/                       # GUI protected
 curl -X POST http://localhost:8000/api/migrations/$JOB/cancel

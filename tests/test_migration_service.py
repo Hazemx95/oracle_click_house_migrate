@@ -622,7 +622,7 @@ def test_insert_semaphore_limits_concurrency_and_releases_after_failure(monkeypa
         observed["permit_was_held"] = not controller.semaphore.acquire(blocking=False)
         raise RuntimeError("insert failed")
 
-    monkeypatch.setattr(migration_service.clickhouse_client, "get_client", lambda: FakeClickHouse())
+    monkeypatch.setattr(migration_service.clickhouse_client, "get_insert_client", lambda: FakeClickHouse())
     monkeypatch.setattr(migration_service.oracle_client, "get_connection", lambda: FakeConnection())
     monkeypatch.setattr(migration_service.clickhouse_client, "insert_rows", failing_insert_rows)
 
@@ -847,6 +847,59 @@ def test_non_transient_insert_error_is_not_retried(monkeypatch) -> None:
     assert calls["count"] == 1
 
 
+def test_insert_timeout_is_never_retried_even_when_retries_enabled(monkeypatch) -> None:
+    monkeypatch.setattr(
+        migration_service,
+        "get_settings",
+        lambda: Settings(clickhouse_insert_retry_attempts=2),
+    )
+    calls = {"count": 0}
+    job_id = job_service.create_job(
+        source_schema="CM",
+        source_table="COMPONENT",
+        target_database=TARGET_DATABASE,
+        target_table="CM__COMPONENT",
+    )
+    controller = migration_service._new_insert_controller()  # noqa: SLF001
+
+    def timeout_insert(*args, **kwargs):  # type: ignore[no-untyped-def]
+        calls["count"] += 1
+        raise clickhouse_client.ClickHouseInsertTimeoutError("timed out")
+
+    monkeypatch.setattr(migration_service.clickhouse_client, "insert_rows", timeout_insert)
+
+    try:
+        migration_service._insert_with_retry(  # noqa: SLF001
+            job_id=job_id,
+            target_table="CM__COMPONENT",
+            insert_chunk=[(1,)],
+            column_names=["ID"],
+            target_database=TARGET_DATABASE,
+            clickhouse=object(),
+            controller=controller,
+        )
+    except clickhouse_client.ClickHouseInsertTimeoutError:
+        migration_service._record_insert_failure(  # noqa: SLF001
+            job_id=job_id,
+            worker_id=None,
+            chunk_id=1,
+            batch_number=1,
+            range_start=None,
+            range_end=None,
+            inserted_rows_before_failure=0,
+            exc=clickhouse_client.ClickHouseInsertTimeoutError("timed out"),
+        )
+    else:  # pragma: no cover - defensive assertion
+        raise AssertionError("timeout insert was retried or swallowed")
+
+    status = job_service.get_status(job_id)
+    assert calls["count"] == 1
+    assert controller.cancellation.is_set()
+    assert status["status"] == "FAILED"
+    assert status["clickhouse_insert_timeout_count"] == 1.0
+    assert status["clickhouse_insert_retries"] == 0
+
+
 def test_run_parallel_timeout_cancels_other_workers_and_fails_job(monkeypatch) -> None:
     job_id = job_service.create_job(
         source_schema="CM",
@@ -973,7 +1026,7 @@ def test_build_worker_ranges_uses_dynamic_chunk_count_for_numeric_and_date(monke
         "get_settings",
         lambda: Settings(migration_dynamic_chunks_enabled=True, migration_chunks_per_worker=4),
     )
-    monkeypatch.setattr(migration_service, "_min_max_values", lambda schema, table, column: (0, 120))
+    monkeypatch.setattr(migration_service, "_min_max_values", lambda schema, table, column: (0, 1000))
     numeric_request = migration_service.InitialLoadRequest(
         source_schema="CM",
         source_table="COMPONENT",
@@ -984,6 +1037,7 @@ def test_build_worker_ranges_uses_dynamic_chunk_count_for_numeric_and_date(monke
         batch_size=100,
         partition_mode="numeric",
         partition_column_scale=0,
+        total_rows=12_000_000,
     )
     date_request = migration_service.InitialLoadRequest(
         source_schema="CM",
@@ -994,15 +1048,133 @@ def test_build_worker_ranges_uses_dynamic_chunk_count_for_numeric_and_date(monke
         workers=3,
         batch_size=100,
         partition_mode="date",
+        total_rows=12_000_000,
     )
     monkeypatch.setattr(
         migration_service,
         "_min_max_values",
-        lambda schema, table, column: (0, 120) if column == "ID" else (
+        lambda schema, table, column: (0, 1000) if column == "ID" else (
             migration_service.datetime(2026, 1, 1),
             migration_service.datetime(2026, 1, 13),
         ),
     )
 
-    assert len(migration_service._build_worker_ranges(numeric_request)) == 12  # noqa: SLF001
-    assert len(migration_service._build_worker_ranges(date_request)) == 12  # noqa: SLF001
+    assert len(migration_service._build_worker_ranges(numeric_request)) >= 3 * 64  # noqa: SLF001
+    assert len(migration_service._build_worker_ranges(date_request)) >= 3 * 64  # noqa: SLF001
+
+
+def test_resolve_effective_settings_defaults_and_override_isolation(monkeypatch) -> None:
+    settings = Settings(
+        oracle_arraysize=50000,
+        clickhouse_insert_batch_size=25000,
+        clickhouse_max_concurrent_inserts=2,
+        migration_chunks_per_worker=64,
+        validation_mode="fast",
+    )
+    monkeypatch.setattr(migration_service, "get_settings", lambda: settings)
+
+    defaults = migration_service.resolve_effective_settings({})
+    override = migration_service.resolve_effective_settings(
+        {
+            "oracle_fetch_batch_size": 10000,
+            "clickhouse_insert_batch_size": 5000,
+            "max_concurrent_clickhouse_inserts": 1,
+            "validation_mode": "none",
+            "dynamic_chunks_per_worker": 128,
+        }
+    )
+
+    assert defaults.effective_oracle_fetch_batch_size == 50000
+    assert defaults.effective_clickhouse_insert_batch_size == 25000
+    assert override.effective_oracle_fetch_batch_size == 10000
+    assert override.effective_clickhouse_insert_batch_size == 5000
+    assert override.effective_max_concurrent_clickhouse_inserts == 1
+    assert override.effective_validation_mode == "none"
+    assert settings.clickhouse_insert_batch_size == 25000
+
+
+def test_adaptive_insert_size_decreases_and_respects_min(monkeypatch) -> None:
+    monkeypatch.setattr(
+        migration_service,
+        "get_settings",
+        lambda: Settings(
+            clickhouse_insert_slow_seconds=45,
+            clickhouse_insert_target_seconds=30,
+            clickhouse_min_insert_batch_size=1000,
+            clickhouse_max_insert_batch_size=25000,
+        ),
+    )
+    effective = migration_service.resolve_effective_settings({"clickhouse_insert_batch_size": 2000})
+    controller = migration_service._new_insert_controller(effective)  # noqa: SLF001
+    job_id = job_service.create_job(
+        source_schema="CM",
+        source_table="COMPONENT",
+        target_database=TARGET_DATABASE,
+        target_table="CM__COMPONENT",
+        effective_settings=effective.as_dict(),
+    )
+
+    migration_service._record_adaptive_duration(job_id, controller, 60.0)  # noqa: SLF001
+    migration_service._record_adaptive_duration(job_id, controller, 60.0)  # noqa: SLF001
+
+    status = job_service.get_status(job_id)
+    assert controller.adaptive_batch_size == 1000
+    assert status["current_adaptive_insert_batch_size"] == 1000
+
+
+def test_adaptive_insert_size_increases_without_exceeding_max(monkeypatch) -> None:
+    monkeypatch.setattr(
+        migration_service,
+        "get_settings",
+        lambda: Settings(
+            clickhouse_insert_slow_seconds=45,
+            clickhouse_insert_target_seconds=30,
+            clickhouse_min_insert_batch_size=1000,
+            clickhouse_max_insert_batch_size=3000,
+        ),
+    )
+    effective = migration_service.resolve_effective_settings({"clickhouse_insert_batch_size": 2000})
+    controller = migration_service._new_insert_controller(effective)  # noqa: SLF001
+    job_id = job_service.create_job(
+        source_schema="CM",
+        source_table="COMPONENT",
+        target_database=TARGET_DATABASE,
+        target_table="CM__COMPONENT",
+        effective_settings=effective.as_dict(),
+    )
+
+    for _ in range(9):
+        migration_service._record_adaptive_duration(job_id, controller, 1.0)  # noqa: SLF001
+
+    assert controller.adaptive_batch_size == 3000
+
+
+def test_adaptive_insert_disabled_keeps_batch_size_fixed(monkeypatch) -> None:
+    monkeypatch.setattr(
+        migration_service,
+        "get_settings",
+        lambda: Settings(
+            clickhouse_adaptive_insert_enabled=False,
+            clickhouse_insert_slow_seconds=45,
+            clickhouse_insert_target_seconds=30,
+            clickhouse_min_insert_batch_size=1000,
+            clickhouse_max_insert_batch_size=25000,
+        ),
+    )
+    effective = migration_service.resolve_effective_settings({"clickhouse_insert_batch_size": 2000})
+    controller = migration_service._new_insert_controller(effective)  # noqa: SLF001
+    job_id = job_service.create_job(
+        source_schema="CM",
+        source_table="COMPONENT",
+        target_database=TARGET_DATABASE,
+        target_table="CM__COMPONENT",
+        effective_settings=effective.as_dict(),
+    )
+
+    migration_service._record_adaptive_duration(job_id, controller, 60.0)  # noqa: SLF001
+    migration_service._record_adaptive_duration(job_id, controller, 1.0)  # noqa: SLF001
+
+    status = job_service.get_status(job_id)
+    assert controller.adaptive_batch_size == 2000
+    assert status["current_adaptive_insert_batch_size"] == 2000
+    assert status["performance_diagnostics"]["slow_insert_count"] == 1.0

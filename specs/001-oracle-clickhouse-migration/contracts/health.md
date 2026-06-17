@@ -46,10 +46,17 @@ Internally runs `SELECT 1` and `SELECT name FROM system.databases WHERE name = '
   "database": "clickhouse",
   "can_connect": true,
   "target_database": "oracle_migration_hazem",
-  "target_database_exists": true
+  "target_database_exists": true,
+  "effective_timeouts": {
+    "connect_timeout": 15,
+    "send_receive_timeout": 900,
+    "insert_timeout": 900,
+    "compress": true
+  }
 }
 ```
 
 **Notes**
 - No credentials appear in any response or log line.
 - `target_database_exists` may be `false`; this is reported, not auto-fixed by default.
+- **Phase 8.2.1**: `effective_timeouts` reports the timeout/compression values **actually applied** to the `clickhouse-connect` client (capability-guarded; `insert_timeout` only where the installed driver supports it), so the configured ClickHouse timeout settings are verifiably visible. Contains no credentials.

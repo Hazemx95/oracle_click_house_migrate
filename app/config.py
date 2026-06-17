@@ -72,6 +72,11 @@ class Settings(BaseModel):
     clickhouse_max_concurrent_inserts: int = 1
     clickhouse_insert_retry_attempts: int = 0
     clickhouse_insert_retry_backoff_seconds: int = 2
+    clickhouse_insert_target_seconds: int = 30
+    clickhouse_insert_slow_seconds: int = 45
+    clickhouse_adaptive_insert_enabled: bool = True
+    clickhouse_min_insert_batch_size: int = 1000
+    clickhouse_max_insert_batch_size: int = 25000
     migration_max_workers: int = 8
     migration_absolute_max_workers: int = 16
     migration_dynamic_chunks_enabled: bool = True
@@ -97,6 +102,33 @@ def get_settings() -> Settings:
     migration_default_workers = _env_positive_int("MIGRATION_DEFAULT_WORKERS", 4)
     if migration_default_workers > migration_max_workers:
         raise ValueError("MIGRATION_DEFAULT_WORKERS must be less than or equal to MIGRATION_MAX_WORKERS")
+    clickhouse_insert_batch_size = _env_positive_int(
+        "CLICKHOUSE_INSERT_BATCH_SIZE",
+        25000,
+    )
+    clickhouse_insert_target_seconds = _env_positive_int(
+        "CLICKHOUSE_INSERT_TARGET_SECONDS",
+        30,
+    )
+    clickhouse_insert_slow_seconds = _env_positive_int(
+        "CLICKHOUSE_INSERT_SLOW_SECONDS",
+        45,
+    )
+    clickhouse_min_insert_batch_size = _env_positive_int(
+        "CLICKHOUSE_MIN_INSERT_BATCH_SIZE",
+        1000,
+    )
+    clickhouse_max_insert_batch_size = _env_positive_int(
+        "CLICKHOUSE_MAX_INSERT_BATCH_SIZE",
+        25000,
+    )
+    if clickhouse_insert_slow_seconds < clickhouse_insert_target_seconds:
+        raise ValueError("CLICKHOUSE_INSERT_SLOW_SECONDS must be greater than or equal to CLICKHOUSE_INSERT_TARGET_SECONDS")
+    if clickhouse_min_insert_batch_size > clickhouse_insert_batch_size:
+        raise ValueError("CLICKHOUSE_MIN_INSERT_BATCH_SIZE must be less than or equal to CLICKHOUSE_INSERT_BATCH_SIZE")
+    if clickhouse_insert_batch_size > clickhouse_max_insert_batch_size:
+        raise ValueError("CLICKHOUSE_INSERT_BATCH_SIZE must be less than or equal to CLICKHOUSE_MAX_INSERT_BATCH_SIZE")
+
     return Settings(
         clickhouse_host=os.getenv("CLICKHOUSE_HOST", ""),
         clickhouse_port=int(os.getenv("CLICKHOUSE_PORT", "8123")),
@@ -131,10 +163,7 @@ def get_settings() -> Settings:
             900,
         ),
         clickhouse_compress=_env_bool("CLICKHOUSE_COMPRESS", True),
-        clickhouse_insert_batch_size=_env_positive_int(
-            "CLICKHOUSE_INSERT_BATCH_SIZE",
-            25000,
-        ),
+        clickhouse_insert_batch_size=clickhouse_insert_batch_size,
         clickhouse_max_concurrent_inserts=_env_positive_int(
             "CLICKHOUSE_MAX_CONCURRENT_INSERTS",
             2,
@@ -147,10 +176,15 @@ def get_settings() -> Settings:
             "CLICKHOUSE_INSERT_RETRY_BACKOFF_SECONDS",
             2,
         ),
+        clickhouse_insert_target_seconds=clickhouse_insert_target_seconds,
+        clickhouse_insert_slow_seconds=clickhouse_insert_slow_seconds,
+        clickhouse_adaptive_insert_enabled=_env_bool("CLICKHOUSE_ADAPTIVE_INSERT_ENABLED", True),
+        clickhouse_min_insert_batch_size=clickhouse_min_insert_batch_size,
+        clickhouse_max_insert_batch_size=clickhouse_max_insert_batch_size,
         migration_max_workers=migration_max_workers,
         migration_absolute_max_workers=migration_absolute_max_workers,
         migration_dynamic_chunks_enabled=_env_bool("MIGRATION_DYNAMIC_CHUNKS_ENABLED", True),
-        migration_chunks_per_worker=_env_positive_int("MIGRATION_CHUNKS_PER_WORKER", 16),
+        migration_chunks_per_worker=_env_positive_int("MIGRATION_CHUNKS_PER_WORKER", 64),
         migration_parallel_min_rows=_env_positive_int(
             "MIGRATION_PARALLEL_MIN_ROWS",
             100000,

@@ -29,7 +29,12 @@ def test_settings_load_defaults(monkeypatch) -> None:
     assert settings.migration_max_workers == 8
     assert settings.migration_absolute_max_workers == 16
     assert settings.migration_dynamic_chunks_enabled is True
-    assert settings.migration_chunks_per_worker == 16
+    assert settings.migration_chunks_per_worker == 64
+    assert settings.clickhouse_insert_target_seconds == 30
+    assert settings.clickhouse_insert_slow_seconds == 45
+    assert settings.clickhouse_adaptive_insert_enabled is True
+    assert settings.clickhouse_min_insert_batch_size == 1000
+    assert settings.clickhouse_max_insert_batch_size == 25000
     assert settings.migration_parallel_min_rows == 100000
     assert settings.validation_mode == "fast"
     assert settings.validation_timeout_seconds == 600

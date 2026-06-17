@@ -18,7 +18,6 @@ def test_create_job_initializes_phase_6_fields() -> None:
     )
 
     job = job_service.get_job(job_id)
-    assert job is None
     assert job is not None
     assert job["job_id"] == job_id
     assert job["status"] == "PENDING"
@@ -71,6 +70,9 @@ def test_create_job_initializes_phase_6_fields() -> None:
         "validation_mode",
         "validation_timeout_seconds",
         "insert_failure",
+        "current_adaptive_insert_batch_size",
+        "chunk_count",
+        "skew_ratio",
     ):
         assert key in diagnostics
 
@@ -284,4 +286,52 @@ def test_adaptive_recommendations_surface_from_diagnostics() -> None:
     status = job_service.get_status(job_id)
 
     assert status is not None
-    assert "ClickHouse insert timeout detected. Reduce CLICKHOUSE_INSERT_BATCH_SIZE" in status["recommendations"][0]
+    assert status["recommendations"][0] == "ClickHouse insert timeout detected. Reduce insert batch size and max concurrent inserts."
+
+
+def test_effective_settings_surface_in_job_and_status() -> None:
+    effective_settings = {
+        "effective_oracle_fetch_batch_size": 50000,
+        "effective_clickhouse_insert_batch_size": 10000,
+        "effective_max_concurrent_clickhouse_inserts": 1,
+        "effective_validation_mode": "fast",
+        "effective_dynamic_chunks_per_worker": 64,
+        "effective_clickhouse_connect_timeout_seconds": 15,
+        "effective_clickhouse_send_receive_timeout_seconds": 900,
+        "current_adaptive_insert_batch_size": 10000,
+    }
+    job_id = job_service.create_job(
+        source_schema="CM",
+        source_table="COMPONENT",
+        target_database=TARGET_DATABASE,
+        target_table="CM__COMPONENT",
+        effective_settings=effective_settings,
+    )
+
+    job = job_service.get_job(job_id)
+    status = job_service.get_status(job_id)
+
+    assert job["effective_settings"] == effective_settings
+    assert status["effective_settings"] == effective_settings
+    assert status["current_adaptive_insert_batch_size"] == 10000
+
+
+def test_insert_chunk_diagnostics_are_bounded() -> None:
+    job_id = job_service.create_job(
+        source_schema="CM",
+        source_table="COMPONENT",
+        target_database=TARGET_DATABASE,
+        target_table="CM__COMPONENT",
+    )
+
+    for index in range(250):
+        job_service.record_insert_chunk(job_id, index + 1, float(index) / 10)
+
+    diagnostics = job_service.get_status(job_id)["performance_diagnostics"]
+    assert diagnostics["insert_chunk_count"] == 250
+    assert len(diagnostics["rows_per_insert_chunk"]) == job_service.MAX_DIAGNOSTIC_SAMPLES
+    assert len(diagnostics["insert_chunk_duration_seconds"]) == job_service.MAX_DIAGNOSTIC_SAMPLES
+    assert diagnostics["rows_per_insert_chunk_min"] == 1
+    assert diagnostics["rows_per_insert_chunk_max"] == 250
+    assert diagnostics["insert_chunk_duration_seconds_min"] == 0.0
+    assert diagnostics["insert_chunk_duration_seconds_max"] == 24.9
